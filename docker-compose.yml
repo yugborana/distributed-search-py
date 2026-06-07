@@ -1,0 +1,271 @@
+version: '3.8'
+
+services:
+  # ETCD Cluster
+  etcd0:
+    image: quay.io/coreos/etcd:v3.5.12
+    container_name: etcd0
+    environment:
+      - ETCD_NAME=etcd0
+      - ETCD_LISTEN_CLIENT_URLS=http://0.0.0.0:2379
+      - ETCD_ADVERTISE_CLIENT_URLS=http://etcd0:2379
+      - ETCD_LISTEN_PEER_URLS=http://0.0.0.0:2380
+      - ETCD_INITIAL_ADVERTISE_PEER_URLS=http://etcd0:2380
+      - ETCD_INITIAL_CLUSTER=etcd0=http://etcd0:2380,etcd1=http://etcd1:2380,etcd2=http://etcd2:2380
+      - ETCD_INITIAL_CLUSTER_TOKEN=search-cluster
+      - ETCD_INITIAL_CLUSTER_STATE=new
+    ports:
+      - "2379:2379"
+    networks:
+      - search-net
+
+  etcd1:
+    image: quay.io/coreos/etcd:v3.5.12
+    container_name: etcd1
+    environment:
+      - ETCD_NAME=etcd1
+      - ETCD_LISTEN_CLIENT_URLS=http://0.0.0.0:2379
+      - ETCD_ADVERTISE_CLIENT_URLS=http://etcd1:2379
+      - ETCD_LISTEN_PEER_URLS=http://0.0.0.0:2380
+      - ETCD_INITIAL_ADVERTISE_PEER_URLS=http://etcd1:2380
+      - ETCD_INITIAL_CLUSTER=etcd0=http://etcd0:2380,etcd1=http://etcd1:2380,etcd2=http://etcd2:2380
+      - ETCD_INITIAL_CLUSTER_TOKEN=search-cluster
+      - ETCD_INITIAL_CLUSTER_STATE=new
+    networks:
+      - search-net
+
+  etcd2:
+    image: quay.io/coreos/etcd:v3.5.12
+    container_name: etcd2
+    environment:
+      - ETCD_NAME=etcd2
+      - ETCD_LISTEN_CLIENT_URLS=http://0.0.0.0:2379
+      - ETCD_ADVERTISE_CLIENT_URLS=http://etcd2:2379
+      - ETCD_LISTEN_PEER_URLS=http://0.0.0.0:2380
+      - ETCD_INITIAL_ADVERTISE_PEER_URLS=http://etcd2:2380
+      - ETCD_INITIAL_CLUSTER=etcd0=http://etcd0:2380,etcd1=http://etcd1:2380,etcd2=http://etcd2:2380
+      - ETCD_INITIAL_CLUSTER_TOKEN=search-cluster
+      - ETCD_INITIAL_CLUSTER_STATE=new
+    networks:
+      - search-net
+
+  redis:
+    image: redis:7-alpine
+    container_name: redis
+    command: redis-server --maxmemory 256mb --maxmemory-policy allkeys-lru
+    ports:
+      - "6379:6379"
+    networks:
+      - search-net
+
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama-data:/root/.ollama
+    networks:
+      - search-net
+    restart: unless-stopped
+
+  # Shards
+  shard-0:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.shard
+    container_name: shard-0
+    command: 
+      - "--shard-id=0"
+      - "--port=8080"
+      - "--hostname=shard-0"
+      - "--index=/app/search.idx"
+      - "--etcd-host=etcd0,etcd1,etcd2"
+    volumes:
+      - .:/app
+      - ./search.idx-0:/app/search.idx-0
+    networks:
+      - search-net
+    depends_on:
+      - etcd0
+      - etcd1
+      - etcd2
+
+  shard-1:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.shard
+    container_name: shard-1
+    command:
+      - "--shard-id=1"
+      - "--port=8080"
+      - "--hostname=shard-1"
+      - "--index=/app/search.idx"
+      - "--etcd-host=etcd0,etcd1,etcd2"
+    volumes:
+      - .:/app
+      - ./search.idx-1:/app/search.idx-1
+    networks:
+      - search-net
+    depends_on:
+      - etcd0
+      - etcd1
+      - etcd2
+
+  shard-2:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.shard
+    container_name: shard-2
+    command:
+      - "--shard-id=2"
+      - "--port=8080"
+      - "--hostname=shard-2"
+      - "--index=/app/search.idx"
+      - "--etcd-host=etcd0,etcd1,etcd2"
+    volumes:
+      - .:/app
+      - ./search.idx-2:/app/search.idx-2
+    networks:
+      - search-net
+    depends_on:
+      - etcd0
+      - etcd1
+      - etcd2
+
+  shard-3:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.shard
+    container_name: shard-3
+    command:
+      - "--shard-id=3"
+      - "--port=8080"
+      - "--hostname=shard-3"
+      - "--index=/app/search.idx"
+      - "--etcd-host=etcd0,etcd1,etcd2"
+    volumes:
+      - .:/app
+      - ./search.idx-3:/app/search.idx-3
+    networks:
+      - search-net
+    depends_on:
+      - etcd0
+      - etcd1
+      - etcd2
+
+  shard-4:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.shard
+    container_name: shard-4
+    command:
+      - "--shard-id=4"
+      - "--port=8080"
+      - "--hostname=shard-4"
+      - "--index=/app/search.idx"
+      - "--etcd-host=etcd0,etcd1,etcd2"
+    volumes:
+      - .:/app
+      - ./search.idx-4:/app/search.idx-4
+    networks:
+      - search-net
+    depends_on:
+      - etcd0
+      - etcd1
+      - etcd2
+
+  shard-5:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.shard
+    container_name: shard-5
+    command:
+      - "--shard-id=5"
+      - "--port=8080"
+      - "--hostname=shard-5"
+      - "--index=/app/search.idx"
+      - "--etcd-host=etcd0,etcd1,etcd2"
+    volumes:
+      - .:/app
+      - ./search.idx-5:/app/search.idx-5
+    networks:
+      - search-net
+    depends_on:
+      - etcd0
+      - etcd1
+      - etcd2
+
+  shard-6:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.shard
+    container_name: shard-6
+    command:
+      - "--shard-id=6"
+      - "--port=8080"
+      - "--hostname=shard-6"
+      - "--index=/app/search.idx"
+      - "--etcd-host=etcd0,etcd1,etcd2"
+    volumes:
+      - .:/app
+      - ./search.idx-6:/app/search.idx-6
+    networks:
+      - search-net
+    depends_on:
+      - etcd0
+      - etcd1
+      - etcd2
+
+  shard-7:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.shard
+    container_name: shard-7
+    command:
+      - "--shard-id=7"
+      - "--port=8080"
+      - "--hostname=shard-7"
+      - "--index=/app/search.idx"
+      - "--etcd-host=etcd0,etcd1,etcd2"
+    volumes:
+      - .:/app
+      - ./search.idx-7:/app/search.idx-7
+    networks:
+      - search-net
+    depends_on:
+      - etcd0
+      - etcd1
+      - etcd2
+
+  coordinator:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.coord
+    container_name: coordinator
+    ports:
+      - "8090:8090"
+    environment:
+      - ETCD_HOSTS=etcd0,etcd1,etcd2
+      - REDIS_HOST=redis
+      - OLLAMA_HOST=ollama
+      - FUSION_ALPHA=0.5
+      - PYTHONPATH=/app
+    entrypoint: ["uvicorn", "cmd.coordinator:app", "--host", "0.0.0.0", "--port", "8090", "--workers", "4", "--loop", "uvloop", "--reload"]
+    volumes:
+      - .:/app
+    networks:
+      - search-net
+    depends_on:
+      - etcd0
+      - etcd1
+      - etcd2
+      - redis
+      - ollama
+
+networks:
+  search-net:
+    driver: bridge
+
+volumes:
+  ollama-data:

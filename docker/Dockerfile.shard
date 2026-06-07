@@ -1,0 +1,10 @@
+FROM python:3.13-slim
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+# Copy the entire python project
+COPY . .
+EXPOSE 8080
+# Use environment variables or CMD to run the searcher
+# We expect the docker-compose to pass the appropriate args
+ENTRYPOINT ["python", "cmd/searcher.py"]
