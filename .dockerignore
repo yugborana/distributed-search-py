@@ -1,0 +1,43 @@
+# Git
+.git/
+.gitignore
+
+# Index data (can be hundreds of MB — mounted as volumes, not baked into image)
+search.idx*
+data/
+*.jsonl
+
+# Original Go project (not needed in Python containers)
+distributed-search-main/
+
+# Python caches
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.mypy_cache/
+.pytest_cache/
+
+# IDE
+.vscode/
+.idea/
+.agents/
+
+# Benchmarks and test artifacts (not needed at runtime)
+benchmarks/
+tests/
+*.log
+
+# Docs
+*.md
+LICENSE
+
+# Docker files (no need to copy Docker config into the image)
+docker/
+docker-compose.yml
+.dockerignore
+
+# Misc
+.env
+*.bak
+*.swp

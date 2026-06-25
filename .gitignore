@@ -29,6 +29,6 @@ search.idx*
 *.bleve*
 
 # Docker
-.dockerignore
+
 
 tests/
