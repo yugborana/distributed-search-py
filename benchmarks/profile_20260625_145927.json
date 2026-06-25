@@ -1,0 +1,54 @@
+[
+  {
+    "endpoint": "search",
+    "concurrency": 50,
+    "duration_s": 0.0,
+    "total_requests": 0,
+    "successful": 0,
+    "failed": 0,
+    "qps": 0.0,
+    "latency_p50_ms": 0.0,
+    "latency_p95_ms": 0.0,
+    "latency_p99_ms": 0.0,
+    "latency_mean_ms": 0
+  },
+  {
+    "endpoint": "hybrid",
+    "concurrency": 50,
+    "duration_s": 0.0,
+    "total_requests": 0,
+    "successful": 0,
+    "failed": 0,
+    "qps": 0.0,
+    "latency_p50_ms": 0.0,
+    "latency_p95_ms": 0.0,
+    "latency_p99_ms": 0.0,
+    "latency_mean_ms": 0
+  },
+  {
+    "endpoint": "search",
+    "concurrency": 100,
+    "duration_s": 0.0,
+    "total_requests": 0,
+    "successful": 0,
+    "failed": 0,
+    "qps": 0.0,
+    "latency_p50_ms": 0.0,
+    "latency_p95_ms": 0.0,
+    "latency_p99_ms": 0.0,
+    "latency_mean_ms": 0
+  },
+  {
+    "endpoint": "hybrid",
+    "concurrency": 100,
+    "duration_s": 0.0,
+    "total_requests": 0,
+    "successful": 0,
+    "failed": 0,
+    "qps": 0.0,
+    "latency_p50_ms": 0.0,
+    "latency_p95_ms": 0.0,
+    "latency_p99_ms": 0.0,
+    "latency_mean_ms": 0
+  }
+]

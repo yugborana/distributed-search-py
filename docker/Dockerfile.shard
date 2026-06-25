@@ -1,10 +1,21 @@
-FROM python:3.13-slim
+FROM python:3.11-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
 WORKDIR /app
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
-# Copy the entire python project
-COPY . .
+
+# Minimal deps — no fastembed, no redis, no lxml
+COPY requirements.shard.txt .
+RUN pip install --no-cache-dir --no-compile -r requirements.shard.txt
+
+COPY cmd/ cmd/
+COPY internal/ internal/
+COPY system_config.yaml .
+
 EXPOSE 8080
-# Use environment variables or CMD to run the searcher
-# We expect the docker-compose to pass the appropriate args
+
+HEALTHCHECK --interval=10s --timeout=3s --start-period=5s --retries=3 \
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')" || exit 1
+
 ENTRYPOINT ["python", "cmd/searcher.py"]

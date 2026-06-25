@@ -1,52 +1,27 @@
 # Distributed Search — System Configuration
-# This file defines all tuneable parameters for the search pipeline.
 
 shards:
   count: 8
   routing: "md5"
 
 index:
-  type: "ivfpq"              # "ivfpq" (Phase 1) or "diskann" (Phase 2)
   dimension: 384              # embedding dimension (all-minilm)
-  # DiskANN-specific (Phase 2 — only used when type: "diskann"):
-  R: 64                       # graph degree. 32→90% recall, 64→95%, 96→99%
-  L_build: 100                # search list size during build
-  B: 0.003                    # SSD read budget per query (GB)
-  M_pq: 64                    # PQ bytes for beam search scoring
-  cache_ram_gb: 4.0            # RAM for hotspot cache per shard
-  beam_width: 8                # beam search width at query time
-  search_L: 100                # search-time complexity parameter
-
-quantization:
-  enabled: true               # Phase 1: Quantization Cascade ON
-  type: "ivfpq"
-  nlist: 4096                 # adaptive — reduced automatically for small datasets
-  M: 48                       # 384/8 = 48 subvectors → 48 bytes/vector
-  nbits: 8                    # 256 centroids per subquantizer
-  nprobe: 64                  # search 64/4096 = ~1.5% of partitions per query
-  rerank_k: 500               # PQ candidates to exact-rerank
 
 embedding:
   provider: "ollama"
   model: "all-minilm"
-  batch_size: 1
 
 storage:
   backend: "local"
   path: "/data/shards"
 
 cache:
-  redis_ttl: 300              # seconds
-  hybrid_ttl: 60              # seconds
-  vector_cache_ttl: 3600      # 1 hour — embedding cache
+  redis_ttl: 300
+  hybrid_ttl: 60
+  vector_cache_ttl: 3600
 
 coordinator:
   port: 8090
-  shard_timeout: 5.0          # per-shard timeout seconds
-  max_connections: 200         # httpx connection pool
-  fusion_alpha: 0.5            # BM25 vs Semantic weight
-
-benchmark:
-  concurrency_levels: [50, 100, 200]
-  duration_seconds: 60
-  query_sample_size: 1000
+  shard_timeout: 5.0
+  max_connections: 200
+  fusion_alpha: 0.5

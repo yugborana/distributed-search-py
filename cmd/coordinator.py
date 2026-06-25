@@ -1,8 +1,8 @@
 """
-Coordinator — Phase 2
+Coordinator
 
 Discovers shards via etcd and fans out search queries to all of them,
-merging the results.
+merging the results. Includes straggler mitigation and per-stage profiling.
 """
 
 import argparse
@@ -12,21 +12,29 @@ import logging
 import time
 import hashlib
 import gzip
-import uvloop
 import os
 import sys
+from collections import OrderedDict
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from typing import List, Dict, Any
 
-from internal.embed import OllamaClient
+from internal.embed import create_embed_client
 from internal.hybrid import fuse_with_weights, fuse_with_rrf
-from internal.routing import HotTermMapper
 
 from fastapi import FastAPI, Query, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, ORJSONResponse
 import uvicorn
-import httpx
+import aiohttp
+try:
+    import grpc
+    from internal.proto import shard_pb2, shard_pb2_grpc
+except ImportError:
+    grpc = None
+    shard_pb2 = None
+    shard_pb2_grpc = None
+
+_grpc_stubs = {}
 try:
     import etcd3
 except ImportError:
@@ -43,74 +51,134 @@ handler = logging.StreamHandler(sys.stdout)
 handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
 log.addHandler(handler)
 
-app = FastAPI(title="Distributed Search — Coordinator")
+# PERF-PYDANTIC: Use ORJSONResponse as default response class.
+# FastAPI's default JSONResponse runs jsonable_encoder() + stdlib json.dumps()
+# on every response. ORJSONResponse uses orjson.dumps() directly — 3-10x faster
+# for numeric-heavy payloads (hit scores, vectors).
+app = FastAPI(title="Distributed Search — Coordinator", default_response_class=ORJSONResponse)
 
 etcd_host_global = os.environ.get("ETCD_HOSTS", "localhost")
 redis_host_global = os.environ.get("REDIS_HOST", "localhost")
 ollama_host_global = os.environ.get("OLLAMA_HOST", "localhost")
+embed_provider = os.environ.get("EMBED_PROVIDER", "local")
 fusion_alpha_default = float(os.environ.get("FUSION_ALPHA", "0.5"))
+
+# PERF-13: In-process partition sharding eliminates all network overhead.
+# Set SHARD_MODE=inprocess to load all Tantivy partitions directly.
+# Set SHARD_MODE=distributed (default for backward compat) for gRPC fan-out.
+shard_mode = os.environ.get("SHARD_MODE", "distributed")
+index_base_path = os.environ.get("INDEX_BASE", "/app/search.idx")
+num_partitions = int(os.environ.get("NUM_PARTITIONS", "8"))
 
 rdb = None
 embed_client = None
-routing_mapper = None
-http_pool: httpx.AsyncClient = None  # Shared connection pool (Fix 2)
+http_pool: aiohttp.ClientSession = None  # PERF-03: aiohttp replaces httpx
+partition_manager = None  # PERF-13: Set during startup if SHARD_MODE=inprocess
 CACHE_TTL = 300
 HYBRID_CACHE_TTL = 60
-SHARD_TIMEOUT = 5.0  # Per-shard timeout in seconds (Fix 3)
+SHARD_TIMEOUT = aiohttp.ClientTimeout(total=5.0, connect=2.0)
+STRAGGLER_DEADLINE = 3.0  # return partial results if stragglers exceed this
 
-async def hot_term_refresh_task():
-    """Background task to keep hot terms synced from etcd."""
-    while True:
-        if routing_mapper:
-            routing_mapper.refresh()
-        await asyncio.sleep(30)
+# PERF-14: L0 in-memory result cache — avoids Redis RTT entirely for hot queries.
+# EXTREME PERF: We cache the PRE-SERIALIZED JSON bytes. This avoids running
+# orjson.dumps() 10,000 times a second for the exact same object.
+_L0_CACHE_MAX = 2000
+_L0_TTL = 30.0  # seconds
+_l0_cache: OrderedDict[str, tuple] = OrderedDict()  # key -> (bytes, timestamp)
 
-@app.on_event("startup")
-async def startup_event():
-    global rdb, embed_client, http_pool
+
+def _l0_get(key: str) -> bytes | None:
+    """Get raw JSON bytes from L0 in-memory cache."""
+    if key in _l0_cache:
+        result_bytes, ts = _l0_cache[key]
+        if time.monotonic() - ts < _L0_TTL:
+            _l0_cache.move_to_end(key)
+            return result_bytes
+        else:
+            del _l0_cache[key]
+    return None
+
+
+def _l0_put(key: str, result: dict):
+    """Serialize and put into L0 in-memory cache."""
+    # We pre-bake the "L0_HIT" tag into the bytes so we never have to parse it
+    result_copy = dict(result)
+    result_copy["cache"] = "L0_HIT"
+    result_bytes = orjson.dumps(result_copy)
     
-    if aioredis is not None:
-        # Note: decode_responses=False is important here as we store raw pickled/binary data
-        rdb = aioredis.from_url(f"redis://{redis_host_global}:6379", decode_responses=False)
+    if key in _l0_cache:
+        _l0_cache.move_to_end(key)
+        _l0_cache[key] = (result_bytes, time.monotonic())
+        return
+    if len(_l0_cache) >= _L0_CACHE_MAX:
+        _l0_cache.popitem(last=False)
+    _l0_cache[key] = (result_bytes, time.monotonic())
 
-    # Initialize Ollama Client with Redis for vector caching (Fix 1)
-    embed_client = OllamaClient(
-        base_url=f"http://{ollama_host_global}:11434",
-        redis_client=rdb
-    )
+
+# PERF-15: In-flight request deduplication.
+# Under concurrent load, 50 requests for the same query should NOT trigger
+# 50 separate searches. Only 1 computes; the other 49 await the same Future.
+_inflight_searches: dict[str, asyncio.Future] = {}
+_inflight_hybrid: dict[str, asyncio.Future] = {}
+
+# PERF-10: Threshold for gzip compression. Payloads smaller than this
+# are stored raw — gzip overhead (~0.1-0.5ms CPU) isn't worth the ~30%
+# size reduction on a 2KB payload (saves ~600 bytes in Redis).
+_COMPRESS_THRESHOLD = 2048
+
+
+def _cache_compress(data: dict) -> bytes:
+    """Serialize + conditionally compress for Redis storage.
     
-    # Fix 2: Shared connection pool with high limits for fan-out
-    # Mirrors Go's http.DefaultClient which reuses connections across goroutines
-    http_pool = httpx.AsyncClient(
-        timeout=httpx.Timeout(SHARD_TIMEOUT, connect=2.0),
-        limits=httpx.Limits(max_connections=200, max_keepalive_connections=50),
-    )
+    PERF-10: Uses a 1-byte prefix to auto-detect format on read:
+      b'R' + raw orjson bytes  (payloads <= 2KB)
+      b'G' + gzip bytes        (payloads > 2KB)
+    """
+    raw = orjson.dumps(data)
+    if len(raw) > _COMPRESS_THRESHOLD:
+        return b'G' + gzip.compress(raw, compresslevel=1)  # level 1 = fast
+    return b'R' + raw
 
-    # Initialize Routing Mapper (Phase 4)
-    if etcd3:
-        hosts = etcd_host_global.split(",")
-        log.info(f"Initializing HotTermMapper with etcd hosts: {hosts}")
-        try:
-            client = etcd3.client(host=hosts[0].strip(), port=2379)
-            global routing_mapper
-            routing_mapper = HotTermMapper(client, redis_client=rdb)
-            log.info("HotTermMapper created, performing initial refresh...")
-            routing_mapper.refresh()
-            log.info(f"Initial refresh complete. Terms: {list(routing_mapper.hot_terms.keys())}")
-            asyncio.create_task(hot_term_refresh_task())
-        except Exception as e:
-            log.error(f"Failed to initialize HotTermMapper: {e}")
+
+def _cache_decompress(data: bytes) -> dict:
+    """Decompress + deserialize from Redis storage."""
+    if data[0:1] == b'G':
+        return orjson.loads(gzip.decompress(data[1:]))
+    elif data[0:1] == b'R':
+        return orjson.loads(data[1:])
     else:
-        log.warning("etcd3 not installed, HotTermMapper disabled.")
+        # Legacy format (no prefix) — assume gzip
+        return orjson.loads(gzip.decompress(data))
 
-@app.on_event("shutdown")
-async def shutdown_event():
-    if embed_client:
-        await embed_client.close()
-    if http_pool:
-        await http_pool.aclose()
+# ── Cached shard topology ───────────────────────────────────────────────────
+_shard_cache: Dict[int, str] = {}
+_shard_cache_ts: float = 0
+_SHARD_CACHE_TTL = 5.0
+_etcd_client = None
 
-def discover_shards(client) -> Dict[int, str]:
+
+def _get_etcd_client():
+    """Get or create a reusable etcd client."""
+    global _etcd_client
+    if _etcd_client is not None:
+        return _etcd_client
+    if etcd3 is None:
+        return None
+    hosts = etcd_host_global.split(",")
+    for host in hosts:
+        try:
+            _etcd_client = etcd3.client(host=host.strip(), port=2379)
+            return _etcd_client
+        except Exception as e:
+            log.warning(f"Failed to connect to etcd at {host}: {e}")
+    return None
+
+
+def _discover_shards_sync() -> Dict[int, str]:
+    """Synchronous etcd shard discovery. Runs in thread pool."""
+    client = _get_etcd_client()
+    if client is None:
+        return {}
     shards = {}
     try:
         events = client.get_prefix("/shards/active/")
@@ -122,179 +190,240 @@ def discover_shards(client) -> Dict[int, str]:
             except ValueError:
                 pass
     except Exception as e:
-        log.error(f"Failed to discover shards: {e}")
+        log.warning(f"etcd shard discovery failed: {e}")
+        global _etcd_client
+        _etcd_client = None
     return shards
 
+
+async def get_shards() -> Dict[int, str]:
+    """Get shard topology with caching. Refreshes every 5s."""
+    global _shard_cache, _shard_cache_ts
+    now = time.time()
+    if now - _shard_cache_ts < _SHARD_CACHE_TTL and _shard_cache:
+        return _shard_cache
+    loop = asyncio.get_running_loop()
+    _shard_cache = await loop.run_in_executor(None, _discover_shards_sync)
+    _shard_cache_ts = now
+    return _shard_cache
+
+
+# ── Startup / Shutdown ──────────────────────────────────────────────────────
+
+@app.on_event("startup")
+async def startup_event():
+    global rdb, embed_client, http_pool, partition_manager
+
+    if aioredis is not None:
+        rdb = aioredis.from_url(f"redis://{redis_host_global}:6379", decode_responses=False)
+
+    embed_client = create_embed_client(
+        provider=embed_provider,
+        ollama_url=f"http://{ollama_host_global}:11434",
+        redis_client=rdb,
+    )
+    log.info("Embedding provider: %s", embed_provider)
+
+    if shard_mode == "inprocess":
+        # PERF-13: Load all Tantivy partitions in-process.
+        # Zero network overhead — searches go directly to ThreadPoolExecutor.
+        from internal.partition_manager import PartitionManager
+        partition_manager = PartitionManager(
+            index_base=index_base_path,
+            num_partitions=num_partitions,
+            max_workers=num_partitions,
+        )
+        log.info("SHARD_MODE=inprocess: %d partitions loaded, %d total docs",
+                 len(partition_manager.partitions), partition_manager.total_docs())
+    else:
+        # Distributed mode: fan-out via gRPC/HTTP to separate shard containers
+        http_pool = aiohttp.ClientSession(
+            connector=aiohttp.TCPConnector(
+                limit=200,
+                keepalive_timeout=30,
+                enable_cleanup_closed=True,
+            ),
+            timeout=SHARD_TIMEOUT,
+        )
+        await get_shards()
+        log.info("SHARD_MODE=distributed: Shards discovered: %d", len(_shard_cache))
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    if embed_client:
+        await embed_client.close()
+    if http_pool:
+        await http_pool.close()
+
+
+# ── Shard Query Helpers ─────────────────────────────────────────────────────
+
+def _get_grpc_stub(addr: str):
+    if addr not in _grpc_stubs:
+        host, port_str = addr.split(":")
+        grpc_addr = f"{host}:{int(port_str) + 1000}"
+        channel = grpc.aio.insecure_channel(grpc_addr)
+        _grpc_stubs[addr] = shard_pb2_grpc.ShardServiceStub(channel)
+    return _grpc_stubs[addr]
+
 async def query_shard(addr: str, q: str, limit: int) -> List[Dict[str, Any]]:
-    """Query a single shard using the shared connection pool.
-    
-    Fix 3: Per-shard timeout with graceful degradation.
-    If a shard is slow, we return [] instead of blocking the entire fan-out.
-    Mirrors Go's per-goroutine error handling in fanoutQueryParallel().
-    """
+    """Query a single shard for BM25 results via gRPC."""
+    if grpc and shard_pb2_grpc:
+        try:
+            stub = _get_grpc_stub(addr)
+            req = shard_pb2.SearchRequest(query=q, limit=limit)
+            resp = await stub.Search(req, timeout=2.0)
+            return [
+                {"id": h.id, "score": round(h.score, 6), "title": h.title}
+                for h in resp.hits
+            ]
+        except Exception as e:
+            log.warning(f"gRPC query_shard {addr} failed: {e}")
+            return []
+
     try:
-        resp = await http_pool.get(f"http://{addr}/search", params={"q": q, "limit": limit})
-        resp.raise_for_status()
-        data = resp.json()
-        return data.get("hits", [])
-    except httpx.TimeoutException:
-        log.warning(f"Shard {addr} timed out after {SHARD_TIMEOUT}s (returning partial results)")
-        return []
+        async with http_pool.get(
+            f"http://{addr}/search",
+            params={"q": q, "limit": limit},
+        ) as resp:
+            if resp.status != 200:
+                return []
+            raw = await resp.read()
+            data = orjson.loads(raw)
+            return data.get("hits", [])
     except Exception as e:
         log.error(f"Error querying shard {addr}: {e}")
         return []
 
-async def query_shard_scored(addr: str, q: str, query_vector: list, limit: int) -> List[Dict[str, Any]]:
-    """Phase 3: Near-data scoring — send query + vector to shard for local scoring.
-    
-    POSTs to /scored_search which computes BOTH BM25 and cosine similarity
-    at the shard, returning only (doc_id, bm25_score, semantic_score, title).
-    
-    Network savings: 800 bytes vs 153,600 bytes per shard response (192× reduction).
-    """
+
+async def query_shard_scored(addr: str, body_bytes: bytes) -> List[Dict[str, Any]]:
+    """Near-data scoring — send packed protobuf vector body to shard via gRPC."""
+    if grpc and shard_pb2_grpc:
+        try:
+            body_dict = orjson.loads(body_bytes)
+            stub = _get_grpc_stub(addr)
+            req = shard_pb2.ScoredSearchRequest(
+                query=body_dict["q"],
+                query_vector=body_dict.get("query_vector", []),
+                limit=body_dict.get("limit", 50)
+            )
+            resp = await stub.ScoredSearch(req, timeout=2.0)
+            return [
+                {
+                    "id": h.id,
+                    "bm25_score": round(h.bm25_score, 6),
+                    "semantic_score": round(h.semantic_score, 6),
+                    "score": round(h.score, 6),
+                    "title": h.title
+                }
+                for h in resp.hits
+            ]
+        except Exception as e:
+            log.warning(f"gRPC query_shard_scored {addr} failed: {e}")
+            return []
+
     try:
-        resp = await http_pool.post(
+        async with http_pool.post(
             f"http://{addr}/scored_search",
-            json={"q": q, "query_vector": query_vector, "limit": limit},
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        return data.get("hits", [])
-    except httpx.TimeoutException:
-        log.warning(f"Shard {addr} scored_search timed out after {SHARD_TIMEOUT}s")
-        return []
+            data=body_bytes,
+            headers={"Content-Type": "application/json"},
+        ) as resp:
+            if resp.status != 200:
+                return []
+            raw = await resp.read()
+            data = orjson.loads(raw)
+            return data.get("hits", [])
     except Exception as e:
         log.error(f"Error scored_search shard {addr}: {e}")
         return []
 
-async def do_fanout_search(q: str, limit: int) -> Dict[str, Any]:
-    start = time.time()
+
+# ── Fan-out with straggler mitigation ───────────────────────────────────────
+
+async def fanout_with_deadline(tasks: list, deadline: float) -> list:
+    """Run tasks in parallel, return results from shards that respond within deadline.
     
-    if etcd3 is None:
-        return {"error": "etcd3 not installed"}
-        
-    shards_dict = {}
-    hosts = etcd_host_global.split(",")
-    client = None
-    for host in hosts:
+    If all shards respond before the deadline, all results are used.
+    If some shards are slow (stragglers), we return partial results after
+    the deadline to avoid p99 latency spikes.
+    """
+    wrapped = [asyncio.ensure_future(t) for t in tasks]
+    done, pending = await asyncio.wait(wrapped, timeout=deadline)
+
+    results = []
+    for task in done:
         try:
-            client = etcd3.client(host=host.strip(), port=2379)
-            shards_dict = discover_shards(client)
-            break # Successfully discovered shards
-        except Exception as e:
-            log.warning(f"Failed to connect to ETCD at {host}: {e}")
-            continue
-            
+            results.append(task.result())
+        except Exception:
+            results.append([])
+
+    # Cancel stragglers — don't waste resources
+    stragglers = len(pending)
+    for task in pending:
+        task.cancel()
+        results.append([])  # empty result for cancelled shards
+
+    if stragglers > 0:
+        log.warning(f"Straggler mitigation: {stragglers} shard(s) cancelled after {deadline}s deadline")
+
+    return results
+
+
+# ── Core Search Logic ───────────────────────────────────────────────────────
+
+async def do_fanout_search(q: str, limit: int) -> Dict[str, Any]:
+    start = time.perf_counter()
+
+    # PERF-13: In-process partition search — zero network overhead
+    if partition_manager is not None:
+        sorted_hits, partitions_responded = await partition_manager.search_all(q, limit)
+        took_ms = (time.perf_counter() - start) * 1000
+        return {
+            "query": q,
+            "total_hits": len(sorted_hits),
+            "hits": sorted_hits,
+            "took": f"{took_ms:.1f}ms",
+            "shards_queried": len(partition_manager.partitions),
+            "shards_responded": partitions_responded,
+        }
+
+    # Distributed mode: fan-out via gRPC/HTTP
+    shards_dict = await get_shards()
     if not shards_dict:
-        log.warning("No active shards found in etcd (or all etcd nodes down)")
-        # Still return a valid response format just with 0 hits
         return {"query": q, "total_hits": 0, "hits": [], "took": "0.0ms", "shards_queried": 0}
 
-    # Hot Term Routing logic (Phase 4)
-    routing_type = "cold"
-    target_shards = []
-    
-    if routing_mapper:
-        active_ids = list(shards_dict.keys())
-        target_ids, is_hot = routing_mapper.get_target_shards(q, active_ids)
-        if is_hot:
-            target_shards = [shards_dict[sid] for sid in target_ids]
-            routing_type = "hot"
-        else:
-            target_shards = list(shards_dict.values())
-    else:
-        target_shards = list(shards_dict.values())
-
-    # Use shared connection pool (Fix 2)
+    target_shards = list(shards_dict.values())
     tasks = [query_shard(addr, q, limit) for addr in target_shards]
-    results = await asyncio.gather(*tasks, return_exceptions=True)
+    results = await fanout_with_deadline(tasks, STRAGGLER_DEADLINE)
 
     all_hits = []
+    shards_responded = 0
     for addr, result in zip(target_shards, results):
-        if isinstance(result, list):
+        if isinstance(result, list) and result:
+            shards_responded += 1
             for hit in result:
                 hit["shard"] = addr
                 all_hits.append(hit)
 
-    # 4. Self-Learning (Phase 4 Extension)
-    if routing_type == "cold" and routing_mapper:
-        asyncio.create_task(routing_mapper.record_and_maybe_promote(q, all_hits))
-    # Fix 4: Hot-term stats update (mirrors Go updateHotTermStats)
-    elif routing_type == "hot" and routing_mapper:
-        routing_mapper.update_stats(q, len(all_hits), len(target_shards))
-
-    # Merge Top K
     sorted_hits = sorted(all_hits, key=lambda h: h.get("score", 0), reverse=True)[:limit]
 
-    took = time.time() - start
-    log.info("Coordinator fan-out '%s' across %d shards in %.3fs (routing: %s)", q, len(target_shards), took, routing_type)
-
+    took_ms = (time.perf_counter() - start) * 1000
     return {
         "query": q,
         "total_hits": len(sorted_hits),
         "hits": sorted_hits,
-        "took": f"{took*1000:.1f}ms",
+        "took": f"{took_ms:.1f}ms",
         "shards_queried": len(target_shards),
-        "routing_type": routing_type
+        "shards_responded": shards_responded,
     }
 
-async def cached_search(q: str, limit: int):
-    if rdb is None:
-        # Fallback if redis is not available
-        result = await do_fanout_search(q, limit)
-        return result, "DISABLED"
-
-    # Compute a 64-character SHA256 hex string for the query
-    q_hash = hashlib.sha256(q.encode("utf-8")).hexdigest()
-    cache_key = f"cache:{q_hash}"
-    
-    # Check cache
-    cached = await rdb.get(cache_key)
-    if cached:
-        return orjson.loads(gzip.decompress(cached)), "HIT"
-    
-    # Thundering herd lock
-    lock_key = f"{cache_key}:lock"
-    # redis-py set returns True/False for NX
-    got_lock = await rdb.set(lock_key, "1", nx=True, ex=2)
-    
-    if not got_lock:
-        await asyncio.sleep(0.05)
-        cached = await rdb.get(cache_key)
-        if cached:
-            return orjson.loads(gzip.decompress(cached)), "HIT_WAIT"
-    
-    # Cache miss — do fan-out
-    result = await do_fanout_search(q, limit)
-    
-    # Compress with gzip before storing
-    compressed = gzip.compress(orjson.dumps(result))
-    await rdb.setex(cache_key, CACHE_TTL, compressed)
-    if got_lock:
-        await rdb.delete(lock_key)
-    
-    return result, "MISS"
 
 async def do_hybrid_search(q: str, limit: int, alpha: float, fusion: str) -> Dict[str, Any]:
-    """Phase 3: Hybrid search with near-data scoring.
-    
-    BEFORE Phase 3 (what we had):
-      1. Coordinator embeds query
-      2. Fan-out GET /search to shards → shards return (doc_id, score, title, title_vector)
-      3. Coordinator computes cosine similarity on ALL returned vectors
-      4. Coordinator fuses BM25 + semantic scores
-      Network: 100 hits × 1,536 bytes × 8 shards = 1.2MB per query
-    
-    AFTER Phase 3 (now):
-      1. Coordinator embeds query
-      2. Fan-out POST /scored_search to shards with query_vector
-      3. Shards compute BOTH BM25 + cosine locally, return (doc_id, bm25_score, semantic_score)
-      4. Coordinator only does fusion on pre-computed scores
-      Network: 100 hits × 8 bytes × 8 shards = 6.4KB per query (192× reduction)
-    """
-    start = time.time()
-    
-    # 1. Get query embedding (4-tier cache: memory → redis → in-flight dedup → ollama)
+    """Hybrid search with near-data scoring and per-stage profiling."""
+    t0 = time.perf_counter()
+
+    # Stage 1: Get query embedding
     query_vector = None
     query_vector_list = []
     if embed_client:
@@ -303,68 +432,82 @@ async def do_hybrid_search(q: str, limit: int, alpha: float, fusion: str) -> Dic
             query_vector_list = query_vector if isinstance(query_vector, list) else list(query_vector)
         except Exception as e:
             log.warning(f"Embedding failed for '{q}': {e} (falling back to keyword-only)")
-            
-    # 2. Shard Discovery
-    shards_dict = {}
-    hosts = etcd_host_global.split(",")
-    client = None
-    for host in hosts:
-        try:
-            client = etcd3.client(host=host.strip(), port=2379)
-            shards_dict = discover_shards(client)
-            break
-        except Exception:
-            continue
-            
+    t1 = time.perf_counter()
+
+    # PERF-13: In-process partition scored search — zero network overhead
+    if partition_manager is not None:
+        retrieval_limit = min(limit * 2, 50)
+        all_hits, shards_responded = await partition_manager.scored_search_all(
+            query=q, query_vector=query_vector_list, limit=retrieval_limit
+        )
+        t2 = time.perf_counter()
+
+        if fusion == "rrf" and query_vector:
+            hybrid_hits = fuse_with_rrf(all_hits, query_vector, limit)
+        else:
+            hybrid_hits = fuse_with_weights(all_hits, query_vector, alpha, limit)
+        t3 = time.perf_counter()
+
+        embed_ms = (t1 - t0) * 1000
+        fanout_ms = (t2 - t1) * 1000
+        fusion_ms = (t3 - t2) * 1000
+        total_ms = (t3 - t0) * 1000
+
+        return {
+            "query": q,
+            "keyword_hits": len(all_hits),
+            "fusion_method": fusion,
+            "fusion_alpha": alpha if fusion != "rrf" else None,
+            "hits": hybrid_hits,
+            "took": f"{total_ms:.1f}ms",
+            "shards_queried": len(partition_manager.partitions),
+            "shards_responded": shards_responded,
+            "scoring": "near-data",
+            "timing": {
+                "embed_ms": round(embed_ms, 2),
+                "fanout_ms": round(fanout_ms, 2),
+                "fusion_ms": round(fusion_ms, 2),
+                "total_ms": round(total_ms, 2),
+            },
+        }
+
+    # Distributed mode: fan-out via gRPC/HTTP
+    shards_dict = await get_shards()
     if not shards_dict:
         return {"query": q, "total_hits": 0, "hits": [], "took": "0.0ms", "shards_queried": 0}
 
-    # 3. Hot Term Routing
-    routing_type = "cold"
-    target_shards = []
-    if routing_mapper:
-        active_ids = list(shards_dict.keys())
-        target_ids, is_hot = routing_mapper.get_target_shards(q, active_ids)
-        if is_hot:
-            target_shards = [shards_dict[sid] for sid in target_ids]
-            routing_type = "hot"
-        else:
-            target_shards = list(shards_dict.values())
-    else:
-        target_shards = list(shards_dict.values())
+    target_shards = list(shards_dict.values())
 
-    # 4. Fan-out to /scored_search — scoring happens at shards (Phase 3)
-    retrieval_limit = 100 if fusion == "rrf" else limit * 3
+    # Stage 3: Fan-out to /scored_search with straggler mitigation
+    retrieval_limit = min(limit * 2, 50)
+    body_bytes = orjson.dumps({"q": q, "query_vector": query_vector_list, "limit": retrieval_limit})
     tasks = [
-        query_shard_scored(addr, q, query_vector_list, retrieval_limit)
+        query_shard_scored(addr, body_bytes)
         for addr in target_shards
     ]
-    results = await asyncio.gather(*tasks, return_exceptions=True)
+    results = await fanout_with_deadline(tasks, STRAGGLER_DEADLINE)
+    t2 = time.perf_counter()
 
     all_hits = []
     shards_responded = 0
     for addr, result in zip(target_shards, results):
-        if isinstance(result, list):
+        if isinstance(result, list) and result:
             shards_responded += 1
             for hit in result:
                 hit["shard"] = addr
                 all_hits.append(hit)
 
-    # 5. Fusion — scores are already computed, coordinator just merges
+    # Stage 4: Fusion — scores already computed at shards
     if fusion == "rrf" and query_vector:
         hybrid_hits = fuse_with_rrf(all_hits, query_vector, limit)
     else:
         hybrid_hits = fuse_with_weights(all_hits, query_vector, alpha, limit)
+    t3 = time.perf_counter()
 
-    # 6. Self-Learning (Phase 4 Extension)
-    if routing_type == "cold" and routing_mapper:
-        asyncio.create_task(routing_mapper.record_and_maybe_promote(q, all_hits))
-    elif routing_type == "hot" and routing_mapper:
-        routing_mapper.update_stats(q, len(all_hits), len(target_shards))
-
-    took = time.time() - start
-    log.info("Coordinator HYBRID [%s] '%s' across %d/%d shards in %.3fs (routing: %s, scoring: near-data)",
-             fusion, q, shards_responded, len(target_shards), took, routing_type)
+    embed_ms = (t1 - t0) * 1000
+    fanout_ms = (t2 - t1) * 1000
+    fusion_ms = (t3 - t2) * 1000
+    total_ms = (t3 - t0) * 1000
 
     return {
         "query": q,
@@ -372,134 +515,203 @@ async def do_hybrid_search(q: str, limit: int, alpha: float, fusion: str) -> Dic
         "fusion_method": fusion,
         "fusion_alpha": alpha if fusion != "rrf" else None,
         "hits": hybrid_hits,
-        "took": f"{took*1000:.1f}ms",
+        "took": f"{total_ms:.1f}ms",
         "shards_queried": len(target_shards),
         "shards_responded": shards_responded,
-        "routing_type": routing_type,
-        "scoring": "near-data",  # Phase 3 indicator
+        "scoring": "near-data",
+        "timing": {
+            "embed_ms": round(embed_ms, 2),
+            "fanout_ms": round(fanout_ms, 2),
+            "fusion_ms": round(fusion_ms, 2),
+            "total_ms": round(total_ms, 2),
+        },
     }
+
+
+# ── Caching Layer ───────────────────────────────────────────────────────────
+
+
+def _fast_cache_key(prefix: str, *parts) -> str:
+    """PERF-16: Fast cache key using Python's built-in hash instead of SHA-256."""
+    return f"{prefix}:{hash(parts)}"
+
+
+async def _redis_set_bg(cache_key: str, ttl: int, data: dict):
+    """PERF-17: Fire-and-forget Redis write. Don't block response on cache SET."""
+    try:
+        await rdb.setex(cache_key, ttl, _cache_compress(data))
+    except Exception:
+        pass
+
+
+async def cached_search(q: str, limit: int):
+    cache_key = _fast_cache_key("s", q, limit)
+
+    # PERF-14: L0 in-memory cache — bypasses ORJSONResponse serialization entirely
+    l0_bytes = _l0_get(cache_key)
+    if l0_bytes is not None:
+        from fastapi.responses import Response
+        return Response(content=l0_bytes, media_type="application/json"), "L0_HIT"
+
+    # PERF-15: In-flight deduplication — only 1 computation per unique query
+    if cache_key in _inflight_searches:
+        result = await _inflight_searches[cache_key]
+        return result, "COALESCED"
+
+    if rdb is not None:
+        try:
+            cached = await rdb.get(cache_key)
+            if cached:
+                result = _cache_decompress(cached)
+                _l0_put(cache_key, result)
+                return result, "HIT"
+        except Exception:
+            pass
+
+    # Create an in-flight future so concurrent requests coalesce
+    loop = asyncio.get_running_loop()
+    future = loop.create_future()
+    _inflight_searches[cache_key] = future
+
+    try:
+        result = await do_fanout_search(q, limit)
+        _l0_put(cache_key, result)
+        future.set_result(result)
+
+        # PERF-17: Fire-and-forget Redis write
+        if rdb is not None:
+            asyncio.create_task(_redis_set_bg(cache_key, CACHE_TTL, result))
+
+        return result, "MISS"
+    except Exception as e:
+        future.set_exception(e)
+        raise
+    finally:
+        _inflight_searches.pop(cache_key, None)
+
+
+# ── Endpoints ───────────────────────────────────────────────────────────────
 
 @app.get("/search")
 async def search_handler(
     q: str = Query(None, description="Search query"),
     limit: int = Query(20, ge=1, le=1000, description="Number of results"),
-    response: Request = None,
 ):
     if not q:
-        return JSONResponse(
-            status_code=400,
-            content={"error": "missing 'q' parameter"},
-        )
+        return JSONResponse(status_code=400, content={"error": "missing 'q' parameter"})
+
+    result_or_response, cache_state = await cached_search(q, limit)
     
-    result, cache_state = await cached_search(q, limit)
-    # Note: Adding custom header to the response could be done with FastAPI Response,
-    # but we will just add it to the JSON body for easier verification based on the spec
-    result["cache"] = cache_state
-    return result
+    # If L0 hit, we get a pre-serialized raw Response object
+    from fastapi.responses import Response
+    if isinstance(result_or_response, Response):
+        return result_or_response
+
+    # Otherwise, it's a dict that needs serialization
+    result_or_response["cache"] = cache_state
+    return result_or_response
+
 
 @app.get("/hybrid")
 async def hybrid_handler(
     q: str = Query(None, description="Search query"),
     limit: int = Query(20, ge=1, le=1000, description="Number of results"),
-    alpha: float = Query(fusion_alpha_default, ge=0.0, le=1.0, description="Weight for BM25 score (1-alpha for semantic)"),
-    fusion: str = Query("rrf", regex="^(rrf|weighted)$", description="Fusion method"),
+    alpha: float = Query(fusion_alpha_default, ge=0.0, le=1.0),
+    fusion: str = Query("rrf", regex="^(rrf|weighted)$"),
 ):
     if not q:
         return JSONResponse(status_code=400, content={"error": "missing 'q' parameter"})
-    
-    # Fix 5: Hybrid search caching via Redis
-    if rdb:
-        q_hash = hashlib.sha256(f"{q}:{limit}:{fusion}".encode("utf-8")).hexdigest()
-        cache_key = f"hybrid:{q_hash}"
+
+    cache_key = _fast_cache_key("h", q, limit, fusion, alpha)
+
+    # PERF-14: L0 in-memory cache — bypasses ORJSONResponse serialization entirely
+    l0_bytes = _l0_get(cache_key)
+    if l0_bytes is not None:
+        from fastapi.responses import Response
+        return Response(content=l0_bytes, media_type="application/json")
+
+    # PERF-15: In-flight deduplication
+    if cache_key in _inflight_hybrid:
+        result = await _inflight_hybrid[cache_key]
+        result = dict(result)  # shallow copy so we can mutate cache field
+        result["cache"] = "COALESCED"
+        return result
+
+    if rdb is not None:
         try:
             cached = await rdb.get(cache_key)
             if cached:
-                result = orjson.loads(gzip.decompress(cached))
+                result = _cache_decompress(cached)
+                _l0_put(cache_key, result)
                 result["cache"] = "HIT"
                 return result
         except Exception:
             pass
 
-    result = await do_hybrid_search(q, limit, alpha, fusion)
-    
-    # Store in cache
-    if rdb:
-        try:
-            compressed = gzip.compress(orjson.dumps(result))
-            await rdb.setex(f"hybrid:{hashlib.sha256(f'{q}:{limit}:{fusion}'.encode('utf-8')).hexdigest()}",
-                           HYBRID_CACHE_TTL, compressed)
-        except Exception:
-            pass
-    
-    result["cache"] = "MISS"
-    return result
+    # Create in-flight future
+    loop = asyncio.get_running_loop()
+    future = loop.create_future()
+    _inflight_hybrid[cache_key] = future
+
+    try:
+        result = await do_hybrid_search(q, limit, alpha, fusion)
+        _l0_put(cache_key, result)
+        future.set_result(result)
+
+        # PERF-17: Fire-and-forget Redis write
+        if rdb is not None:
+            asyncio.create_task(_redis_set_bg(cache_key, HYBRID_CACHE_TTL, result))
+
+        result["cache"] = "MISS"
+        return result
+    except Exception as e:
+        future.set_exception(e)
+        raise
+    finally:
+        _inflight_hybrid.pop(cache_key, None)
+
 
 @app.get("/health")
 async def health():
     return "OK"
 
-@app.get("/routing")
-async def routing_status():
-    return {
-        "hot_terms": routing_mapper.hot_terms if routing_mapper else {},
-        "last_refresh": routing_mapper.last_refresh if routing_mapper else 0,
-        "enabled": routing_mapper is not None
-    }
 
 @app.get("/cluster_stats")
 async def cluster_stats():
     """Aggregate statistics from all active shards."""
-    # Discover shards
-    shards = []
-    hosts = etcd_host_global.split(",")
-    for host in hosts:
-        try:
-            client = etcd3.client(host=host.strip(), port=2379)
-            shards_dict = discover_shards(client)
-            shards = list(shards_dict.values())
-            break
-        except Exception:
-            continue
-            
+    shards_dict = await get_shards()
+    shards = list(shards_dict.values())
+
     async def get_shard_stats(addr):
         try:
-            resp = await http_pool.get(f"http://{addr}/stats")
-            return resp.json()
+            async with http_pool.get(f"http://{addr}/stats") as resp:
+                raw = await resp.read()
+                return orjson.loads(raw)
         except Exception as e:
             return {"addr": addr, "status": f"down: {str(e)}"}
 
     results = await asyncio.gather(*[get_shard_stats(addr) for addr in shards])
     total_docs = sum(r.get("doc_count", 0) for r in results if isinstance(r, dict))
-    
+
     return {
         "total_shards": len(shards),
         "total_documents": total_docs,
         "shards": results,
-        "hot_terms_count": len(routing_mapper.hot_terms) if routing_mapper else 0
     }
+
 
 @app.get("/shards")
 async def shards_handler():
-    if etcd3 is None:
-        return {"count": 0, "active_shards": []}
-        
-    active = []
-    hosts = etcd_host_global.split(",")
-    for host in hosts:
-        try:
-            client = etcd3.client(host=host.strip(), port=2379)
-            active = discover_shards(client)
-            break
-        except Exception:
-            continue
-            
+    active = await get_shards()
     return {
         "count": len(active),
-        "active_shards": list(active.values()) if isinstance(active, dict) else active
+        "active_shards": list(active.values()) if isinstance(active, dict) else active,
     }
 
+
+# ── Main ────────────────────────────────────────────────────────────────────
+
 def main():
-    uvloop.install()
     global etcd_host_global, redis_host_global
     parser = argparse.ArgumentParser(description="Coordinator search server")
     parser.add_argument("--port", type=int, default=8090, help="HTTP port")
@@ -512,12 +724,48 @@ def main():
 
     log.info("Coordinator service ready :%d", args.port)
 
+    # PERF-02: uvloop gives a 2-4x faster event loop on Linux (Docker).
+    # On Windows, it's not available — graceful fallback.
+    loop_policy = "auto"
+    try:
+        import uvloop
+        uvloop.install()
+        loop_policy = "uvloop"
+        log.info("uvloop installed")
+    except ImportError:
+        pass
+
+    # PERF-11: httptools replaces uvicorn's default h11 (pure Python) HTTP
+    # parser with llhttp (C-accelerated) — ~5x faster request parsing.
+    http_impl = "auto"
+    try:
+        import httptools  # noqa: F401
+        http_impl = "httptools"
+        log.info("httptools available")
+    except ImportError:
+        pass
+
     uvicorn.run(
-        app,
+        "cmd.coordinator:app",
         host="0.0.0.0",
         port=args.port,
-        log_level="info",
+        log_level="warning",
+        access_log=False,
+        # PERF-02: Reduced from 8 to 2 workers.
+        # The coordinator is I/O-bound (fan-out to shards + Redis), not CPU-bound.
+        # With 8 workers, each loads a 150MB ONNX model (1.2GB total) and has its
+        # own embedding cache — diluting cache hit rate by 8x.
+        # With 2 workers: 300MB total, 4x better cache hit rate, and async I/O
+        # handles the concurrency.
+        # PERF-18: workers=2 even for inprocess mode.
+        # Tantivy indexes are mmap'd files — fork() shares physical pages
+        # via copy-on-write. Only the Python heap (~70MB) is duplicated,
+        # NOT the ~120MB of index data. Two event loops double throughput.
+        workers=2,
+        loop=loop_policy,
+        http=http_impl,  # PERF-11: C-accelerated HTTP parsing
     )
+
 
 if __name__ == "__main__":
     main()

@@ -1,0 +1,217 @@
+{
+  "timestamp": "2026-06-25T20:32:37",
+  "endpoint": "search",
+  "system_config": {
+    "shards": {
+      "count": 8,
+      "routing": "md5"
+    },
+    "index": {
+      "dimension": 384
+    },
+    "embedding": {
+      "provider": "ollama",
+      "model": "all-minilm"
+    },
+    "storage": {
+      "backend": "local",
+      "path": "/data/shards"
+    },
+    "cache": {
+      "redis_ttl": 300,
+      "hybrid_ttl": 60,
+      "vector_cache_ttl": 3600
+    },
+    "coordinator": {
+      "port": 8090,
+      "shard_timeout": 5.0,
+      "max_connections": 200,
+      "fusion_alpha": 0.5
+    }
+  },
+  "cluster_stats": {
+    "total_shards": 8,
+    "total_documents": 43305,
+    "shards": [
+      {
+        "shard": "shard-0",
+        "doc_count": 2265,
+        "index_path": "/app/search.idx-0"
+      },
+      {
+        "shard": "shard-1",
+        "doc_count": 9155,
+        "index_path": "/app/search.idx-1"
+      },
+      {
+        "shard": "shard-2",
+        "doc_count": 5565,
+        "index_path": "/app/search.idx-2"
+      },
+      {
+        "shard": "shard-3",
+        "doc_count": 5817,
+        "index_path": "/app/search.idx-3"
+      },
+      {
+        "shard": "shard-4",
+        "doc_count": 8260,
+        "index_path": "/app/search.idx-4"
+      },
+      {
+        "shard": "shard-5",
+        "doc_count": 1426,
+        "index_path": "/app/search.idx-5"
+      },
+      {
+        "shard": "shard-6",
+        "doc_count": 4432,
+        "index_path": "/app/search.idx-6"
+      },
+      {
+        "shard": "shard-7",
+        "doc_count": 6385,
+        "index_path": "/app/search.idx-7"
+      }
+    ]
+  },
+  "latency": [
+    {
+      "concurrency": 50,
+      "total_requests": 379144,
+      "successful": 379144,
+      "failed": 0,
+      "duration_seconds": 66.51,
+      "qps": 5700.77,
+      "latency_min_ms": 0.69,
+      "latency_p50_ms": 7.57,
+      "latency_p95_ms": 13.96,
+      "latency_p99_ms": 19.04,
+      "latency_max_ms": 738.84,
+      "latency_mean_ms": 8.02,
+      "error_types": {}
+    },
+    {
+      "concurrency": 100,
+      "total_requests": 266800,
+      "successful": 266800,
+      "failed": 0,
+      "duration_seconds": 58.73,
+      "qps": 4542.8,
+      "latency_min_ms": 1.83,
+      "latency_p50_ms": 17.7,
+      "latency_p95_ms": 32.14,
+      "latency_p99_ms": 67.26,
+      "latency_max_ms": 464.5,
+      "latency_mean_ms": 19.09,
+      "error_types": {}
+    },
+    {
+      "concurrency": 200,
+      "total_requests": 132500,
+      "successful": 132500,
+      "failed": 0,
+      "duration_seconds": 30.75,
+      "qps": 4309.11,
+      "latency_min_ms": 4.12,
+      "latency_p50_ms": 30.93,
+      "latency_p95_ms": 103.99,
+      "latency_p99_ms": 234.2,
+      "latency_max_ms": 377.92,
+      "latency_mean_ms": 40.12,
+      "error_types": {}
+    }
+  ],
+  "storage": [
+    {
+      "shard": "shard-0",
+      "index_path": "C:\\Users\\DELL\\Desktop\\distributed-search-py\\search.idx-0",
+      "size_bytes": 9725826,
+      "size_mb": 9.28
+    },
+    {
+      "shard": "shard-1",
+      "index_path": "C:\\Users\\DELL\\Desktop\\distributed-search-py\\search.idx-1",
+      "size_bytes": 31977653,
+      "size_mb": 30.5
+    },
+    {
+      "shard": "shard-2",
+      "index_path": "C:\\Users\\DELL\\Desktop\\distributed-search-py\\search.idx-2",
+      "size_bytes": 19560916,
+      "size_mb": 18.65
+    },
+    {
+      "shard": "shard-3",
+      "index_path": "C:\\Users\\DELL\\Desktop\\distributed-search-py\\search.idx-3",
+      "size_bytes": 20374478,
+      "size_mb": 19.43
+    },
+    {
+      "shard": "shard-4",
+      "index_path": "C:\\Users\\DELL\\Desktop\\distributed-search-py\\search.idx-4",
+      "size_bytes": 57605221,
+      "size_mb": 54.94
+    },
+    {
+      "shard": "shard-5",
+      "index_path": "C:\\Users\\DELL\\Desktop\\distributed-search-py\\search.idx-5",
+      "size_bytes": 4996998,
+      "size_mb": 4.77
+    },
+    {
+      "shard": "shard-6",
+      "index_path": "C:\\Users\\DELL\\Desktop\\distributed-search-py\\search.idx-6",
+      "size_bytes": 15588577,
+      "size_mb": 14.87
+    },
+    {
+      "shard": "shard-7",
+      "index_path": "C:\\Users\\DELL\\Desktop\\distributed-search-py\\search.idx-7",
+      "size_bytes": 44565958,
+      "size_mb": 42.5
+    }
+  ],
+  "memory": [
+    {
+      "container": "shard-0",
+      "rss_mb": 63.05,
+      "limit_mb": 256.0
+    },
+    {
+      "container": "shard-1",
+      "rss_mb": 61.27,
+      "limit_mb": 256.0
+    },
+    {
+      "container": "shard-2",
+      "rss_mb": 65.19,
+      "limit_mb": 256.0
+    },
+    {
+      "container": "shard-3",
+      "rss_mb": 59.9,
+      "limit_mb": 256.0
+    },
+    {
+      "container": "shard-4",
+      "rss_mb": 60.82,
+      "limit_mb": 256.0
+    },
+    {
+      "container": "shard-5",
+      "rss_mb": 59.62,
+      "limit_mb": 256.0
+    },
+    {
+      "container": "shard-6",
+      "rss_mb": 60.93,
+      "limit_mb": 256.0
+    },
+    {
+      "container": "shard-7",
+      "rss_mb": 60.88,
+      "limit_mb": 256.0
+    }
+  ]
+}

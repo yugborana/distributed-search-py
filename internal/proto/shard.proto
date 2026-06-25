@@ -1,0 +1,31 @@
+syntax = "proto3";
+package search;
+
+service ShardService {
+  rpc Search (SearchRequest) returns (SearchResponse);
+  rpc ScoredSearch (ScoredSearchRequest) returns (SearchResponse);
+}
+
+message SearchRequest {
+  string query = 1;
+  int32 limit = 2;
+}
+
+message ScoredSearchRequest {
+  string query = 1;
+  repeated float query_vector = 2 [packed = true];
+  int32 limit = 3;
+}
+
+message Hit {
+  string id = 1;
+  float score = 2;
+  string title = 3;
+  string shard = 4;
+  float bm25_score = 5;
+  float semantic_score = 6;
+}
+
+message SearchResponse {
+  repeated Hit hits = 1;
+}

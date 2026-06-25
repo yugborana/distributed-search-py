@@ -1,5 +1,5 @@
 """
-Indexer CLI — Phase 1
+Indexer CLI
 
 Reads a JSONL file and builds a Tantivy search index on disk.
 
@@ -8,7 +8,7 @@ Mirrors: distributed-search/cmd/indexer/main.go
 Usage:
     python cmd/indexer.py --input docs.jsonl --index search.idx --batch-size 1000
 
-Shard mode (Phase 2):
+Shard mode:
     python cmd/indexer.py --input shard-0.jsonl --index search.idx --shard-id 0
 """
 
@@ -22,7 +22,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from internal.index import SearchIndex
-from internal.embed import OllamaClient
+from internal.embed import create_embed_client
 
 logging.basicConfig(
     level=logging.INFO,
@@ -41,11 +41,13 @@ def main():
                         help="Batch size for periodic commits")
     parser.add_argument("--max-docs", type=int, default=0,
                         help="Max docs to index (0 = all)")
-    parser.add_argument("--ollama-host", default="",
-                        help="Ollama server host (if set, generates embeddings during indexing)")
+    parser.add_argument("--embed-provider", default="",
+                        help="Embedding provider: 'local' (ONNX) or 'ollama' (empty = no embeddings)")
+    parser.add_argument("--ollama-host", default="localhost",
+                        help="Ollama server host (only used if --embed-provider=ollama)")
     args = parser.parse_args()
 
-    # Determine final index path (mirrors Go: fmt.Sprintf("%s-%d", indexBase, shardID))
+    # Determine final index path
     index_path = args.index
     if args.shard_id >= 0:
         index_path = f"{args.index}-{args.shard_id}"
@@ -60,11 +62,14 @@ def main():
 
     start = time.time()
 
-    # Create Ollama client if host is provided
+    # Create embedding client if provider is specified
     embed_client = None
-    if args.ollama_host:
-        log.info("Vector mode: generating embeddings via Ollama at %s", args.ollama_host)
-        embed_client = OllamaClient(base_url=f"http://{args.ollama_host}:11434")
+    if args.embed_provider:
+        log.info("Embedding mode: %s", args.embed_provider)
+        embed_client = create_embed_client(
+            provider=args.embed_provider,
+            ollama_url=f"http://{args.ollama_host}:11434",
+        )
 
     # Create or open the Tantivy index
     idx = SearchIndex(index_path, embed_client=embed_client)
@@ -80,3 +85,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

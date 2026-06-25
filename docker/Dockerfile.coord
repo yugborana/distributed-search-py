@@ -1,8 +1,25 @@
-FROM python:3.13-slim
+FROM python:3.11-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
 WORKDIR /app
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
-# Copy the entire python project
-COPY . .
+
+# Install coordinator deps (includes fastembed for local ONNX embeddings)
+COPY requirements.coord.txt .
+RUN pip install --no-cache-dir --no-compile -r requirements.coord.txt
+
+# Pre-download the ONNX model during build so containers start instantly
+# Without this, first container start downloads ~90MB from HuggingFace
+RUN python -c "from fastembed import TextEmbedding; TextEmbedding('sentence-transformers/all-MiniLM-L6-v2')"
+
+COPY cmd/ cmd/
+COPY internal/ internal/
+COPY system_config.yaml .
+
 EXPOSE 8090
+
+HEALTHCHECK --interval=10s --timeout=3s --start-period=10s --retries=3 \
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8090/health')" || exit 1
+
 ENTRYPOINT ["python", "cmd/coordinator.py"]

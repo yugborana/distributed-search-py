@@ -1,0 +1,70 @@
+[
+  {
+    "endpoint": "search",
+    "concurrency": 50,
+    "duration_s": 15.1,
+    "total_requests": 6451,
+    "successful": 6451,
+    "failed": 0,
+    "qps": 427.9,
+    "latency_p50_ms": 111.4,
+    "latency_p95_ms": 160.2,
+    "latency_p99_ms": 215.8,
+    "latency_mean_ms": 116.5
+  },
+  {
+    "endpoint": "hybrid",
+    "concurrency": 50,
+    "duration_s": 15.1,
+    "total_requests": 6109,
+    "successful": 6109,
+    "failed": 0,
+    "qps": 405.1,
+    "latency_p50_ms": 86.7,
+    "latency_p95_ms": 143.5,
+    "latency_p99_ms": 225.8,
+    "latency_mean_ms": 123.1,
+    "stage_breakdown": {
+      "embed_p50": 0.0,
+      "embed_p95": 42.38,
+      "routing_p50": 0,
+      "fanout_p50": 3068.87,
+      "fanout_p95": 3288.71,
+      "fusion_p50": 0.01
+    }
+  },
+  {
+    "endpoint": "search",
+    "concurrency": 100,
+    "duration_s": 15.1,
+    "total_requests": 11018,
+    "successful": 11018,
+    "failed": 0,
+    "qps": 729.3,
+    "latency_p50_ms": 129.8,
+    "latency_p95_ms": 184.1,
+    "latency_p99_ms": 236.5,
+    "latency_mean_ms": 136.5
+  },
+  {
+    "endpoint": "hybrid",
+    "concurrency": 100,
+    "duration_s": 15.1,
+    "total_requests": 10084,
+    "successful": 10084,
+    "failed": 0,
+    "qps": 666.2,
+    "latency_p50_ms": 143.4,
+    "latency_p95_ms": 211.4,
+    "latency_p99_ms": 231.7,
+    "latency_mean_ms": 149.3,
+    "stage_breakdown": {
+      "embed_p50": 0.0,
+      "embed_p95": 42.38,
+      "routing_p50": 0,
+      "fanout_p50": 3068.88,
+      "fanout_p95": 3288.71,
+      "fusion_p50": 0.01
+    }
+  }
+]

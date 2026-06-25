@@ -1,5 +1,5 @@
 """
-Data Ingester — Phase 1 (single file output)
+Data Ingester
 
 Reads a Wikipedia XML dump, cleans wiki markup, and writes
 documents as JSONL (one JSON object per line).
@@ -32,28 +32,21 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 # ── Constants ───────────────────────────────────────────────────────────────
-# Mirrors: ingester/main.go lines 32-37
 MIN_BODY_LEN = 50
 MAX_BODY_LEN = 2000
-DEFAULT_MAX_DOCS = 50000  # cap for Phase 1 — bump to 0 (unlimited) later
+DEFAULT_MAX_DOCS = 50000
 DEFAULT_WORKERS = 8
 BATCH_SIZE = 1000
 
 
 # ── Text Cleaning ───────────────────────────────────────────────────────────
-# Mirrors: ingester/main.go cleanWikiText() lines 41-65
-
 # Pre-compiled regex patterns for performance
 _WIKI_MARKUP = re.compile(r"\'{2,3}|\[\[|\]\]|\{\{|\}\}|\[|\]")
 _MULTI_SPACE = re.compile(r"\s{2,}")
 
 
 def clean_wiki_text(raw: str) -> str:
-    """Strip wiki markup, collapse whitespace, truncate to MAX_BODY_LEN chars.
-    
-    Same logic as the Go cleanWikiText() — removes ''', [[, ]], {{, }},
-    collapses multiple spaces, and caps at 2000 characters.
-    """
+    """Strip wiki markup, collapse whitespace, truncate to MAX_BODY_LEN chars."""
     text = _WIKI_MARKUP.sub("", raw)
     text = text.replace("\n", " ").replace("\t", " ")
     text = _MULTI_SPACE.sub(" ", text).strip()
@@ -67,8 +60,6 @@ def shard_for_doc(doc_id: str, num_shards: int) -> int:
 
 def process_page(args: tuple) -> Doc | None:
     """Worker function: clean a raw (title, text) tuple into a Doc.
-    
-    Mirrors: ingester/main.go worker() lines 69-95
     Returns None if body is too short after cleaning.
     """
     seq_id, title, raw_text = args
@@ -83,51 +74,42 @@ def process_page(args: tuple) -> Doc | None:
 
 
 # ── XML Streaming Parser ───────────────────────────────────────────────────
-# Mirrors: ingester/main.go XML decoder goroutine, lines 202-239
-# Uses lxml iterparse for memory-efficient streaming of large XML dumps.
 
 def iter_wiki_pages(xml_path: str, max_docs: int = 0):
     """Yield (seq_id, title, text) tuples from a Wikipedia XML dump.
     
     Supports both plain .xml and compressed .xml.bz2 files.
     Uses lxml.etree.iterparse to stream <page> elements without loading
-    the entire file into memory. Elements are cleared after processing
-    to prevent memory blowup on multi-GB dumps.
+    the entire file into memory.
     """
     import bz2
     from lxml import etree
 
-    # Wikipedia XML uses a namespace — we need to handle it
     ns = None
     pages_read = 0
 
-    # Handle bz2-compressed XML files
     if xml_path.endswith(".bz2"):
         log.info("Detected bz2 compression, decompressing on the fly...")
         source = bz2.open(xml_path, "rb")
     else:
-        source = xml_path  # iterparse can take a filename directly
+        source = xml_path
 
     context = etree.iterparse(source, events=("end",), tag=None)
 
     for event, elem in context:
-        # Detect namespace from the first element
         if ns is None and elem.tag.startswith("{"):
             ns = elem.tag.split("}")[0] + "}"
 
-        # Only process <page> elements
         tag_local = elem.tag.replace(ns, "") if ns else elem.tag
         if tag_local != "page":
             continue
 
-        # Extract title
         title_tag = f"{ns}title" if ns else "title"
         title_elem = elem.find(title_tag)
         if title_elem is None or not title_elem.text:
             elem.clear()
             continue
 
-        # Extract revision/text
         rev_tag = f"{ns}revision" if ns else "revision"
         text_tag = f"{ns}text" if ns else "text"
         rev_elem = elem.find(rev_tag)
@@ -142,7 +124,6 @@ def iter_wiki_pages(xml_path: str, max_docs: int = 0):
 
         # Free memory for this element
         elem.clear()
-        # Also clear preceding siblings to keep memory flat
         while elem.getprevious() is not None:
             del elem.getparent()[0]
 
@@ -157,6 +138,22 @@ def iter_wiki_pages(xml_path: str, max_docs: int = 0):
 
 
 # ── Main ────────────────────────────────────────────────────────────────────
+
+def _process_batch(pool, batch, out_files, num_shards):
+    """Process a batch of pages using the shared pool. Returns (written, skipped)."""
+    written = 0
+    skipped = 0
+    futures = [pool.submit(process_page, p) for p in batch]
+    for future in as_completed(futures):
+        doc = future.result()
+        if doc is None:
+            skipped += 1
+            continue
+        shard_id = shard_for_doc(doc.id, num_shards) if num_shards > 1 else 0
+        out_files[shard_id].write(json.dumps(doc.to_dict()) + "\n")
+        written += 1
+    return written, skipped
+
 
 def main():
     parser = argparse.ArgumentParser(description="Wikipedia XML → JSONL ingester")
@@ -184,53 +181,32 @@ def main():
     if args.num_shards == 1:
         out_files[0] = open(args.output, "w", encoding="utf-8")
     else:
-        # e.g. docs.jsonl -> shard-0.jsonl
-        base_name = args.output.replace(".jsonl", "")
-        if base_name == args.output:
-            base_name = "shard"
-        else:
-            base_name = "shard" # Just default to shard-N.jsonl if sharding
         for i in range(args.num_shards):
-            out_files[i] = open(f"{base_name}-{i}.jsonl", "w", encoding="utf-8")
+            out_files[i] = open(f"shard-{i}.jsonl", "w", encoding="utf-8")
 
     try:
-        # Collect pages in batches and process them in parallel
-        batch = []
+        # FIX (PERF-4): Create ONE pool, reuse across all batches
+        # Old code created a new ProcessPoolExecutor per batch (50 pool creations for 50K docs)
+        with ProcessPoolExecutor(max_workers=args.workers) as pool:
+            batch = []
 
-        for page_tuple in iter_wiki_pages(args.input, args.max_docs):
-            batch.append(page_tuple)
+            for page_tuple in iter_wiki_pages(args.input, args.max_docs):
+                batch.append(page_tuple)
 
-            if len(batch) >= BATCH_SIZE:
-                with ProcessPoolExecutor(max_workers=args.workers) as pool:
-                    futures = [pool.submit(process_page, p) for p in batch]
-                    for future in as_completed(futures):
-                        doc = future.result()
-                        if doc is None:
-                            skipped += 1
-                            continue
-                        
-                        shard_id = shard_for_doc(doc.id, args.num_shards) if args.num_shards > 1 else 0
-                        out_files[shard_id].write(json.dumps(doc.to_dict()) + "\n")
-                        total_written += 1
+                if len(batch) >= BATCH_SIZE:
+                    w, s = _process_batch(pool, batch, out_files, args.num_shards)
+                    total_written += w
+                    skipped += s
+                    batch = []
 
-                if total_written % 5000 == 0 and total_written > 0:
-                    log.info("Wrote %d docs so far...", total_written)
+                    if total_written % 5000 == 0 and total_written > 0:
+                        log.info("Wrote %d docs so far...", total_written)
 
-                batch = []
-
-        # Flush remaining batch
-        if batch:
-            with ProcessPoolExecutor(max_workers=args.workers) as pool:
-                futures = [pool.submit(process_page, p) for p in batch]
-                for future in as_completed(futures):
-                    doc = future.result()
-                    if doc is None:
-                        skipped += 1
-                        continue
-
-                    shard_id = shard_for_doc(doc.id, args.num_shards) if args.num_shards > 1 else 0
-                    out_files[shard_id].write(json.dumps(doc.to_dict()) + "\n")
-                    total_written += 1
+            # Flush remaining batch
+            if batch:
+                w, s = _process_batch(pool, batch, out_files, args.num_shards)
+                total_written += w
+                skipped += s
     finally:
         for f in out_files.values():
             f.close()

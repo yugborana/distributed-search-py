@@ -1,18 +1,14 @@
 """
-Tantivy Search Index — Phase 1
+Tantivy Search Index
 
-Wraps tantivy-py to provide Bleve-equivalent functionality:
-  - Schema definition (id, title, body)
+Wraps tantivy-py to provide:
+  - Schema definition (id, title, body, title_vector)
   - Batch document indexing from JSONL
   - BM25 full-text search
+  - Near-data scored search (BM25 + batched cosine similarity)
   - Disk persistence (index directory)
 
 Mirrors: distributed-search/internal/index/indexer.go
-
-Key difference from Go/Bleve:
-  - Bleve uses directory-based indexes → Tantivy also uses directory-based indexes
-  - Bleve batch indexing → Tantivy writer with commit()
-  - Both use BM25 scoring by default
 """
 
 import json
@@ -20,90 +16,79 @@ import logging
 import os
 import time
 import asyncio
+import threading
+from collections import OrderedDict
 from pathlib import Path
 
+import numpy as np
 import tantivy
 
 from internal.model import Doc
-from internal.embed import OllamaClient
 import orjson
 
 log = logging.getLogger(__name__)
+
+# Simple LRU cache for parsed doc vectors (replaces the heavyweight IODedupReader)
+# PERF-01 safety: ThreadPoolExecutor runs scored_search on multiple threads,
+# so all cache access must be protected by a lock.
+_VEC_CACHE_MAX = 50_000  # fits ~73MB for 384-dim float32 vectors
+_vec_cache: OrderedDict[str, np.ndarray] = OrderedDict()
+_vec_cache_lock = threading.Lock()
+
+
+def _vec_cache_get(key: str) -> np.ndarray | None:
+    """Get a cached vector, or None. Moves to end (most-recently-used)."""
+    with _vec_cache_lock:
+        if key in _vec_cache:
+            _vec_cache.move_to_end(key)
+            return _vec_cache[key]
+    return None
+
+
+def _vec_cache_put(key: str, vec: np.ndarray):
+    """Put a vector into the LRU cache."""
+    with _vec_cache_lock:
+        if key in _vec_cache:
+            _vec_cache.move_to_end(key)
+            return
+        if len(_vec_cache) >= _VEC_CACHE_MAX:
+            _vec_cache.popitem(last=False)
+        _vec_cache[key] = vec
 
 
 class SearchIndex:
     """Manages a Tantivy search index on disk.
     
     This is the Python equivalent of the Go `index.Indexer` struct.
-    It wraps tantivy-py's Index, providing create/open/index/search operations.
     """
 
-    def __init__(self, index_path: str, embed_client: OllamaClient = None):
-        """Open an existing index or create a new one at the given path.
-        
-        Mirrors: index/indexer.go NewIndexer() lines 23-25 and NewIndexerWithVectors() lines 27-60
-        
-        Tantivy stores the index as a directory (just like Bleve stores
-        search.bleve-N/ directories), so this is a direct equivalent.
-        """
+    def __init__(self, index_path: str, embed_client=None):
+        """Open an existing index or create a new one at the given path."""
         self.path = index_path
         self.embed_client = embed_client
         self.schema = self._build_schema()
 
         if os.path.exists(index_path) and os.listdir(index_path):
-            # Open existing index
             log.info("Opening existing index at %s", index_path)
             self.index = tantivy.Index(self.schema, path=index_path, reuse=True)
         else:
-            # Create new index
             os.makedirs(index_path, exist_ok=True)
             log.info("Creating new index at %s", index_path)
             self.index = tantivy.Index(self.schema, path=index_path)
 
     @staticmethod
     def _build_schema() -> tantivy.Schema:
-        """Define the document schema.
-        
-        Mirrors the Bleve index mapping from indexer.go lines 34-51:
-          - id: text, stored (for retrieval)
-          - title: text, stored (searchable + retrievable)
-          - body: text, stored (searchable + retrievable, English stemming)
-        
-        Phase 5 will add: title_vector as bytes field for vector storage.
-        """
+        """Define the document schema."""
         builder = tantivy.SchemaBuilder()
-
-        # 'id' — stored for retrieval, indexed as raw (exact match)
         builder.add_text_field("id", stored=True, tokenizer_name="raw")
-
-        # 'title' — full-text searchable with stemming, stored for display
         builder.add_text_field("title", stored=True, tokenizer_name="en_stem")
-
-        # 'body' — full-text searchable with stemming, stored for retrieval
         builder.add_text_field("body", stored=True, tokenizer_name="en_stem")
-
-        # 'title_vector' — stored for Phase 5 semantic search
         builder.add_bytes_field("title_vector", stored=True)
-
         return builder.build()
 
     def index_jsonl(self, jsonl_path: str, batch_size: int = 1000, max_docs: int = 0) -> int:
-        """Read a JSONL file and index all documents into Tantivy.
-        
-        Mirrors: index/indexer.go IndexJSONL() lines 63-166
-        
-        The Go version uses Bleve batch operations. Tantivy-py doesn't have
-        explicit batches, but we commit periodically for the same effect.
-        
-        Args:
-            jsonl_path: Path to the JSONL file (one doc per line)
-            batch_size: Number of docs to buffer before committing
-            max_docs: Stop after this many docs (0 = no limit)
-            
-        Returns:
-            Number of documents indexed
-        """
-        writer = self.index.writer(heap_size=128_000_000)  # 128MB writer heap
+        """Read a JSONL file and index all documents into Tantivy."""
+        writer = self.index.writer(heap_size=128_000_000)
 
         indexed = 0
         skipped = 0
@@ -126,19 +111,21 @@ class SearchIndex:
                 doc = Doc.from_dict(data)
 
                 if self.embed_client and not doc.title_vector:
-                    # Generate embedding if missing and client is available
                     try:
-                        # Ensure we have an event loop and it's running
                         loop = asyncio.get_event_loop()
                         emb = loop.run_until_complete(self.embed_client.get_embedding(doc.title))
                         doc.title_vector = emb
                     except Exception as e:
                         log.warning("Embedding failed for doc %s: %s", doc.id, e)
 
-                # Serialize vector to bytes
-                vec_bytes = orjson.dumps(doc.title_vector) if doc.title_vector else b""
+                # PERF-08: Store vectors as raw float32 bytes instead of JSON.
+                # Raw bytes: np.frombuffer() recovery is ~0.001ms (zero-copy)
+                # JSON bytes: orjson.loads() + np.array() is ~0.08ms (parse + copy)
+                if doc.title_vector:
+                    vec_bytes = np.array(doc.title_vector, dtype=np.float32).tobytes()
+                else:
+                    vec_bytes = b""
 
-                # Add document to Tantivy
                 writer.add_document(tantivy.Document(
                     id=[doc.id],
                     title=[doc.title],
@@ -147,58 +134,31 @@ class SearchIndex:
                 ))
                 indexed += 1
 
-                # Periodic commit (equivalent to Bleve batch flush)
                 if indexed % batch_size == 0:
                     writer.commit()
-
                     if time.time() - last_log > 2.0:
                         elapsed = time.time() - start
                         rate = indexed / elapsed if elapsed > 0 else 0
-                        log.info(
-                            "Progress: %d docs indexed (%.0f/sec)",
-                            indexed, rate,
-                        )
+                        log.info("Progress: %d docs indexed (%.0f/sec)", indexed, rate)
                         last_log = time.time()
 
                 if max_docs > 0 and indexed >= max_docs:
                     log.info("Reached max-docs limit (%d)", max_docs)
                     break
 
-        # Final commit for remaining docs
         writer.commit()
-
-        # Reload to make new documents searchable
         self.index.reload()
 
         elapsed = time.time() - start
         rate = indexed / elapsed if elapsed > 0 else 0
-        log.info("Indexing complete:")
-        log.info("  %d docs indexed, %d skipped", indexed, skipped)
-        log.info("  %.1fs elapsed (%.0f docs/sec)", elapsed, rate)
-
+        log.info("Indexing complete: %d docs indexed, %d skipped in %.1fs (%.0f docs/sec)",
+                 indexed, skipped, elapsed, rate)
         return indexed
 
     def search(self, query_str: str, limit: int = 20) -> list[dict]:
-        """Execute a BM25 search query against the index.
-        
-        Mirrors: searcher/main.go searchHandler() lines 165-208
-        
-        Phase 3: No longer returns title_vector in responses.
-        Scoring happens at the shard via scored_search() instead.
-        
-        Args:
-            query_str: The user's search query text
-            limit: Maximum number of results to return
-            
-        Returns:
-            List of hit dicts with 'id', 'score', 'title' keys
-        """
+        """Execute a BM25 search query against the index."""
         searcher = self.index.searcher()
-
-        # Parse query against title and body fields (BM25 scoring)
         query = self.index.parse_query(query_str, ["title", "body"])
-
-        # Execute search — returns (score, doc_address) tuples
         search_result = searcher.search(query, limit)
 
         hits = []
@@ -209,83 +169,107 @@ class SearchIndex:
                 "score": round(score, 6),
                 "title": doc["title"][0],
             })
-
         return hits
 
-    def scored_search(self, query_str: str, query_vector: list[float], limit: int = 20,
-                       dedup_cache=None) -> list[dict]:
-        """Near-data scoring: BM25 + semantic scoring done locally at the shard.
+    def scored_search(self, query_str: str, query_vector: list[float],
+                      limit: int = 20) -> list[dict]:
+        """Near-data scoring: BM25 + batched cosine similarity at the shard.
         
-        Phase 3: Computes both BM25 and cosine similarity scores right here,
-        returning only (doc_id, bm25_score, semantic_score, title).
-        
-        Phase 4: When dedup_cache (IODedupReader) is provided, parsed doc
-        vectors are cached in its LRU. Under concurrent queries, popular
-        docs' vectors are parsed from Tantivy only once — subsequent
-        queries hit the cache. Under Zipf load, the top 1% of docs appear
-        in ~50% of queries, so this avoids massive redundant parsing.
-        
-        Args:
-            query_str: The user's search query text (for BM25)
-            query_vector: The query embedding (for cosine similarity)
-            limit: Maximum number of results to return
-            dedup_cache: Optional IODedupReader for vector caching (Phase 4)
-            
-        Returns:
-            List of hit dicts with 'id', 'bm25_score', 'semantic_score', 'title'
+        PERF-07 + PERF-08 optimizations:
+          - Query vector: np.asarray() with contiguous fast-path
+          - Doc vectors: np.frombuffer() from raw float32 bytes (zero-copy)
+          - Fallback to orjson.loads() for legacy JSON-encoded vectors
+          - Batched cosine via single BLAS matmul
         """
-        import numpy as np
-
         searcher = self.index.searcher()
         query = self.index.parse_query(query_str, ["title", "body"])
         search_result = searcher.search(query, limit)
 
-        # Pre-compute query vector norm for cosine similarity
+        # PERF-07/19: If query_vector is already a pre-normalized numpy array
+        # (from PartitionManager), skip the redundant conversion and normalization.
         q_vec = None
-        q_norm = 0.0
-        if query_vector and len(query_vector) > 0:
-            q_vec = np.array(query_vector, dtype=np.float32)
-            q_norm = float(np.linalg.norm(q_vec))
+        if query_vector is not None and len(query_vector) > 0:
+            if isinstance(query_vector, np.ndarray):
+                # Already a numpy array — likely pre-normalized by PartitionManager
+                q_vec = query_vector if query_vector.dtype == np.float32 else query_vector.astype(np.float32)
+            else:
+                q_vec = np.asarray(query_vector, dtype=np.float32)
+                q_norm = np.linalg.norm(q_vec)
+                if q_norm > 0:
+                    q_vec *= (1.0 / q_norm)  # in-place normalize (avoids alloc)
+                else:
+                    q_vec = None
 
-        hits = []
-        for bm25_score, doc_address in search_result.hits:
+        # Phase 1: Extract all BM25 hits and their vectors in one pass
+        n_hits = len(search_result.hits)
+        doc_ids = [None] * n_hits
+        titles = [None] * n_hits
+        bm25_scores = [0.0] * n_hits
+        doc_vecs = [None] * n_hits
+        has_vec_flags = [False] * n_hits
+
+        for i, (bm25_score, doc_address) in enumerate(search_result.hits):
             doc = searcher.doc(doc_address)
             doc_id = doc["id"][0]
-            title = doc["title"][0]
 
-            # Compute semantic score locally (Phase 3 near-data scoring)
-            semantic_score = 0.0
-            if q_vec is not None and q_norm > 0:
-                try:
-                    doc_vec = None
+            doc_ids[i] = doc_id
+            titles[i] = doc["title"][0]
+            bm25_scores[i] = float(bm25_score)
 
-                    # Phase 4: check dedup cache first
-                    if dedup_cache is not None:
-                        doc_vec = dedup_cache.get_cached(doc_id)
+            # Try to get the doc vector (from cache or Tantivy)
+            if q_vec is not None:
+                doc_vec = _vec_cache_get(doc_id)
+                if doc_vec is None:
+                    try:
+                        vec_bytes_list = doc["title_vector"]
+                        if vec_bytes_list and len(vec_bytes_list) > 0 and vec_bytes_list[0] is not None:
+                            raw = vec_bytes_list[0]
+                            # PERF-08: Detect format — raw float32 bytes vs JSON
+                            # Raw format: len is exact multiple of 4 and NOT valid JSON
+                            # (JSON always starts with '[' = 0x5B, float32 won't)
+                            if isinstance(raw, bytes) and len(raw) > 0 and raw[0:1] != b'[':
+                                # Raw float32 bytes — np.frombuffer is ~zero-copy
+                                doc_vec = np.frombuffer(raw, dtype=np.float32).copy()
+                            else:
+                                # Legacy JSON format — fallback
+                                if isinstance(raw, memoryview):
+                                    raw = bytes(raw)
+                                doc_vec = np.asarray(orjson.loads(raw), dtype=np.float32)
+                            
+                            if len(doc_vec) > 0:
+                                dnorm = np.linalg.norm(doc_vec)
+                                if dnorm > 0:
+                                    doc_vec *= (1.0 / dnorm)  # in-place normalize
+                                    _vec_cache_put(doc_id, doc_vec)
+                                else:
+                                    doc_vec = None
+                    except Exception:
+                        doc_vec = None
 
-                    # Cache miss — parse from Tantivy stored field
-                    if doc_vec is None:
-                        vec_bytes = doc.get("title_vector", [None])
-                        if vec_bytes and vec_bytes[0]:
-                            doc_vec = np.array(orjson.loads(vec_bytes[0]), dtype=np.float32)
-                            # Phase 4: store in dedup cache for future queries
-                            if dedup_cache is not None:
-                                dedup_cache.put(doc_id, doc_vec)
+                if doc_vec is not None:
+                    doc_vecs[i] = doc_vec
+                    has_vec_flags[i] = True
 
-                    # Cosine similarity
-                    if doc_vec is not None:
-                        doc_norm = float(np.linalg.norm(doc_vec))
-                        if doc_norm > 0:
-                            semantic_score = float(np.dot(q_vec, doc_vec) / (q_norm * doc_norm))
-                except Exception:
-                    pass
+        # Phase 2: Batched cosine similarity — single matrix multiply
+        semantic_scores = np.zeros(n_hits, dtype=np.float32)
+        if q_vec is not None and any(has_vec_flags):
+            # Build matrix of only the docs that have vectors
+            vec_indices = [i for i in range(n_hits) if has_vec_flags[i]]
+            if vec_indices:
+                vec_matrix = np.stack([doc_vecs[i] for i in vec_indices])  # (M, D)
+                cos_scores = vec_matrix @ q_vec  # single BLAS call → (M,)
+                for j, idx in enumerate(vec_indices):
+                    semantic_scores[idx] = cos_scores[j]
 
-            hits.append({
-                "id": doc_id,
-                "bm25_score": round(float(bm25_score), 6),
-                "semantic_score": round(semantic_score, 6),
-                "title": title,
-            })
+        # Phase 3: Build response — pre-allocated list
+        hits = [None] * n_hits
+        for i in range(n_hits):
+            hits[i] = {
+                "id": doc_ids[i],
+                "bm25_score": round(bm25_scores[i], 6),
+                "semantic_score": round(float(semantic_scores[i]), 6),
+                "title": titles[i],
+            }
 
         return hits
 
@@ -295,8 +279,5 @@ class SearchIndex:
         return searcher.num_docs
 
     def close(self):
-        """No-op for Tantivy (index is flushed on commit).
-        
-        Included for API parity with the Go Indexer.Close().
-        """
+        """No-op for Tantivy (index is flushed on commit)."""
         pass
