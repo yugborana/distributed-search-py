@@ -488,7 +488,6 @@ async def do_hybrid_search(q: str, limit: int, alpha: float, fusion: str) -> Dic
             "took": f"{total_ms:.1f}ms",
             "shards_queried": len(partition_manager.partitions),
             "shards_responded": shards_responded,
-            "scoring": "near-data",
             "timing": {
                 "embed_ms": round(embed_ms, 2),
                 "fanout_ms": round(fanout_ms, 2),
@@ -545,7 +544,6 @@ async def do_hybrid_search(q: str, limit: int, alpha: float, fusion: str) -> Dic
         "took": f"{total_ms:.1f}ms",
         "shards_queried": len(target_shards),
         "shards_responded": shards_responded,
-        "scoring": "near-data",
         "timing": {
             "embed_ms": round(embed_ms, 2),
             "fanout_ms": round(fanout_ms, 2),
