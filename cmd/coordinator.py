@@ -35,6 +35,7 @@ except ImportError:
     shard_pb2_grpc = None
 
 _grpc_stubs = {}
+_grpc_channels = {}
 try:
     import etcd3
 except ImportError:
@@ -76,7 +77,7 @@ http_pool: aiohttp.ClientSession = None  # PERF-03: aiohttp replaces httpx
 partition_manager = None  # PERF-13: Set during startup if SHARD_MODE=inprocess
 CACHE_TTL = 300
 HYBRID_CACHE_TTL = 60
-SHARD_TIMEOUT = aiohttp.ClientTimeout(total=5.0, connect=2.0)
+SHARD_TIMEOUT = aiohttp.ClientTimeout(total=2.5, connect=1.0)
 STRAGGLER_DEADLINE = 3.0  # return partial results if stragglers exceed this
 
 # PERF-14: L0 in-memory result cache — avoids Redis RTT entirely for hot queries.
@@ -205,6 +206,19 @@ async def get_shards() -> Dict[int, str]:
     loop = asyncio.get_running_loop()
     _shard_cache = await loop.run_in_executor(None, _discover_shards_sync)
     _shard_cache_ts = now
+    
+    # Evict dead gRPC channels when topology changes
+    active_addrs = set(_shard_cache.values())
+    dead_addrs = set(_grpc_stubs.keys()) - active_addrs
+    for addr in dead_addrs:
+        _grpc_stubs.pop(addr, None)
+        channel = _grpc_channels.pop(addr, None)
+        if channel:
+            try:
+                await channel.close()
+            except Exception:
+                pass
+
     return _shard_cache
 
 
@@ -235,6 +249,16 @@ async def startup_event():
         )
         log.info("SHARD_MODE=inprocess: %d partitions loaded, %d total docs",
                  len(partition_manager.partitions), partition_manager.total_docs())
+
+        # Automatically refresh the in-process searchers to pick up newly indexed docs
+        async def refresh_partitions_task():
+            loop = asyncio.get_running_loop()
+            while True:
+                await asyncio.sleep(30)
+                if partition_manager:
+                    await loop.run_in_executor(None, partition_manager.reload_all)
+
+        asyncio.create_task(refresh_partitions_task())
     else:
         # Distributed mode: fan-out via gRPC/HTTP to separate shard containers
         http_pool = aiohttp.ClientSession(
@@ -264,6 +288,7 @@ def _get_grpc_stub(addr: str):
         host, port_str = addr.split(":")
         grpc_addr = f"{host}:{int(port_str) + 1000}"
         channel = grpc.aio.insecure_channel(grpc_addr)
+        _grpc_channels[addr] = channel
         _grpc_stubs[addr] = shard_pb2_grpc.ShardServiceStub(channel)
     return _grpc_stubs[addr]
 
@@ -436,16 +461,17 @@ async def do_hybrid_search(q: str, limit: int, alpha: float, fusion: str) -> Dic
 
     # PERF-13: In-process partition scored search — zero network overhead
     if partition_manager is not None:
-        retrieval_limit = min(limit * 2, 50)
+        retrieval_limit = max(limit, min(limit * 2, 200))
         all_hits, shards_responded = await partition_manager.scored_search_all(
             query=q, query_vector=query_vector_list, limit=retrieval_limit
         )
         t2 = time.perf_counter()
 
-        if fusion == "rrf" and query_vector:
-            hybrid_hits = fuse_with_rrf(all_hits, query_vector, limit)
+        actual_fusion = "rrf" if (fusion == "rrf" and query_vector) else "weighted"
+        if actual_fusion == "rrf":
+            hybrid_hits = fuse_with_rrf(all_hits, limit)
         else:
-            hybrid_hits = fuse_with_weights(all_hits, query_vector, alpha, limit)
+            hybrid_hits = fuse_with_weights(all_hits, alpha, limit)
         t3 = time.perf_counter()
 
         embed_ms = (t1 - t0) * 1000
@@ -456,8 +482,8 @@ async def do_hybrid_search(q: str, limit: int, alpha: float, fusion: str) -> Dic
         return {
             "query": q,
             "keyword_hits": len(all_hits),
-            "fusion_method": fusion,
-            "fusion_alpha": alpha if fusion != "rrf" else None,
+            "fusion_method": actual_fusion,
+            "fusion_alpha": alpha if actual_fusion != "rrf" else None,
             "hits": hybrid_hits,
             "took": f"{total_ms:.1f}ms",
             "shards_queried": len(partition_manager.partitions),
@@ -479,7 +505,7 @@ async def do_hybrid_search(q: str, limit: int, alpha: float, fusion: str) -> Dic
     target_shards = list(shards_dict.values())
 
     # Stage 3: Fan-out to /scored_search with straggler mitigation
-    retrieval_limit = min(limit * 2, 50)
+    retrieval_limit = max(limit, min(limit * 2, 200))
     body_bytes = orjson.dumps({"q": q, "query_vector": query_vector_list, "limit": retrieval_limit})
     tasks = [
         query_shard_scored(addr, body_bytes)
@@ -498,10 +524,11 @@ async def do_hybrid_search(q: str, limit: int, alpha: float, fusion: str) -> Dic
                 all_hits.append(hit)
 
     # Stage 4: Fusion — scores already computed at shards
-    if fusion == "rrf" and query_vector:
-        hybrid_hits = fuse_with_rrf(all_hits, query_vector, limit)
+    actual_fusion = "rrf" if (fusion == "rrf" and query_vector) else "weighted"
+    if actual_fusion == "rrf":
+        hybrid_hits = fuse_with_rrf(all_hits, limit)
     else:
-        hybrid_hits = fuse_with_weights(all_hits, query_vector, alpha, limit)
+        hybrid_hits = fuse_with_weights(all_hits, alpha, limit)
     t3 = time.perf_counter()
 
     embed_ms = (t1 - t0) * 1000
@@ -512,8 +539,8 @@ async def do_hybrid_search(q: str, limit: int, alpha: float, fusion: str) -> Dic
     return {
         "query": q,
         "keyword_hits": len(all_hits),
-        "fusion_method": fusion,
-        "fusion_alpha": alpha if fusion != "rrf" else None,
+        "fusion_method": actual_fusion,
+        "fusion_alpha": alpha if actual_fusion != "rrf" else None,
         "hits": hybrid_hits,
         "took": f"{total_ms:.1f}ms",
         "shards_queried": len(target_shards),
@@ -532,8 +559,11 @@ async def do_hybrid_search(q: str, limit: int, alpha: float, fusion: str) -> Dic
 
 
 def _fast_cache_key(prefix: str, *parts) -> str:
-    """PERF-16: Fast cache key using Python's built-in hash instead of SHA-256."""
-    return f"{prefix}:{hash(parts)}"
+    """PERF-16: Fast cache key using blake2b.
+    Must be deterministic across processes so Uvicorn workers share the Redis cache.
+    """
+    digest = hashlib.blake2b(repr(parts).encode(), digest_size=8).hexdigest()
+    return f"{prefix}:{digest}"
 
 
 async def _redis_set_bg(cache_key: str, ttl: int, data: dict):
@@ -556,7 +586,7 @@ async def cached_search(q: str, limit: int):
     # PERF-15: In-flight deduplication — only 1 computation per unique query
     if cache_key in _inflight_searches:
         result = await _inflight_searches[cache_key]
-        return result, "COALESCED"
+        return dict(result), "COALESCED"
 
     if rdb is not None:
         try:
@@ -679,6 +709,13 @@ async def health():
 @app.get("/cluster_stats")
 async def cluster_stats():
     """Aggregate statistics from all active shards."""
+    if partition_manager is not None:
+        return {
+            "mode": "inprocess",
+            "total_shards": len(partition_manager.partitions),
+            "total_documents": partition_manager.total_docs(),
+        }
+
     shards_dict = await get_shards()
     shards = list(shards_dict.values())
 
@@ -702,6 +739,13 @@ async def cluster_stats():
 
 @app.get("/shards")
 async def shards_handler():
+    if partition_manager is not None:
+        return {
+            "mode": "inprocess",
+            "count": len(partition_manager.partitions),
+            "active_shards": [f"local-partition-{i}" for i in range(len(partition_manager.partitions))],
+        }
+
     active = await get_shards()
     return {
         "count": len(active),
@@ -728,8 +772,8 @@ def main():
     # On Windows, it's not available — graceful fallback.
     loop_policy = "auto"
     try:
-        import uvloop
-        uvloop.install()
+        import uvloop  # type: ignore
+        uvloop.install()  # type: ignore
         loop_policy = "uvloop"
         log.info("uvloop installed")
     except ImportError:

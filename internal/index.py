@@ -31,29 +31,40 @@ log = logging.getLogger(__name__)
 # Simple LRU cache for parsed doc vectors (replaces the heavyweight IODedupReader)
 # PERF-01 safety: ThreadPoolExecutor runs scored_search on multiple threads,
 # so all cache access must be protected by a lock.
-_VEC_CACHE_MAX = 50_000  # fits ~73MB for 384-dim float32 vectors
-_vec_cache: OrderedDict[str, np.ndarray] = OrderedDict()
-_vec_cache_lock = threading.Lock()
+_VEC_CACHE_MAX_TOTAL = 50_000  # fits ~73MB for 384-dim float32 vectors
+_VEC_CACHE_SHARDS = 16
+_VEC_CACHE_MAX_PER_SHARD = _VEC_CACHE_MAX_TOTAL // _VEC_CACHE_SHARDS
+
+_vec_caches: list[OrderedDict[str, np.ndarray]] = [OrderedDict() for _ in range(_VEC_CACHE_SHARDS)]
+_vec_cache_locks = [threading.Lock() for _ in range(_VEC_CACHE_SHARDS)]
+
+
+def _get_shard_idx(key: str) -> int:
+    return hash(key) % _VEC_CACHE_SHARDS
 
 
 def _vec_cache_get(key: str) -> np.ndarray | None:
     """Get a cached vector, or None. Moves to end (most-recently-used)."""
-    with _vec_cache_lock:
-        if key in _vec_cache:
-            _vec_cache.move_to_end(key)
-            return _vec_cache[key]
+    idx = _get_shard_idx(key)
+    cache = _vec_caches[idx]
+    with _vec_cache_locks[idx]:
+        if key in cache:
+            cache.move_to_end(key)
+            return cache[key]
     return None
 
 
 def _vec_cache_put(key: str, vec: np.ndarray):
     """Put a vector into the LRU cache."""
-    with _vec_cache_lock:
-        if key in _vec_cache:
-            _vec_cache.move_to_end(key)
+    idx = _get_shard_idx(key)
+    cache = _vec_caches[idx]
+    with _vec_cache_locks[idx]:
+        if key in cache:
+            cache.move_to_end(key)
             return
-        if len(_vec_cache) >= _VEC_CACHE_MAX:
-            _vec_cache.popitem(last=False)
-        _vec_cache[key] = vec
+        if len(cache) >= _VEC_CACHE_MAX_PER_SHARD:
+            cache.popitem(last=False)
+        cache[key] = vec
 
 
 class SearchIndex:
@@ -95,7 +106,56 @@ class SearchIndex:
         start = time.time()
         last_log = time.time()
 
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+
+        def _process_batch(docs: list[Doc]):
+            nonlocal indexed, last_log
+            
+            # Batch embedding
+            if self.embed_client:
+                docs_to_embed = [d for d in docs if not d.title_vector]
+                if docs_to_embed:
+                    chunk_size = 256
+                    for i in range(0, len(docs_to_embed), chunk_size):
+                        chunk = docs_to_embed[i:i + chunk_size]
+                        try:
+                            embs = loop.run_until_complete(
+                                self.embed_client.get_embeddings([d.title for d in chunk])
+                            )
+                            for d, emb in zip(chunk, embs):
+                                d.title_vector = emb
+                        except Exception as e:
+                            log.warning("Batch embedding failed: %s", e)
+
+            for doc in docs:
+                if doc.title_vector:
+                    vec_bytes = np.array(doc.title_vector, dtype=np.float32).tobytes()
+                else:
+                    vec_bytes = b""
+
+                # Upsert semantics: Delete old versions of this document (if any) before adding
+                writer.delete_documents("id", doc.id)
+                writer.add_document(tantivy.Document(
+                    id=[doc.id],
+                    title=[doc.title],
+                    body=[doc.body],
+                    title_vector=[vec_bytes],
+                ))
+                indexed += 1
+
+            writer.commit()
+            if time.time() - last_log > 2.0:
+                elapsed = time.time() - start
+                rate = indexed / elapsed if elapsed > 0 else 0
+                log.info("Progress: %d docs indexed (%.0f/sec)", indexed, rate)
+                last_log = time.time()
+
         with open(jsonl_path, "r", encoding="utf-8") as f:
+            batch = []
             for line in f:
                 line = line.strip()
                 if not line:
@@ -108,43 +168,18 @@ class SearchIndex:
                     skipped += 1
                     continue
 
-                doc = Doc.from_dict(data)
+                batch.append(Doc.from_dict(data))
 
-                if self.embed_client and not doc.title_vector:
-                    try:
-                        loop = asyncio.get_event_loop()
-                        emb = loop.run_until_complete(self.embed_client.get_embedding(doc.title))
-                        doc.title_vector = emb
-                    except Exception as e:
-                        log.warning("Embedding failed for doc %s: %s", doc.id, e)
+                if len(batch) >= batch_size:
+                    _process_batch(batch)
+                    batch.clear()
 
-                # PERF-08: Store vectors as raw float32 bytes instead of JSON.
-                # Raw bytes: np.frombuffer() recovery is ~0.001ms (zero-copy)
-                # JSON bytes: orjson.loads() + np.array() is ~0.08ms (parse + copy)
-                if doc.title_vector:
-                    vec_bytes = np.array(doc.title_vector, dtype=np.float32).tobytes()
-                else:
-                    vec_bytes = b""
+                    if max_docs > 0 and indexed >= max_docs:
+                        log.info("Reached max-docs limit (%d)", max_docs)
+                        break
 
-                writer.add_document(tantivy.Document(
-                    id=[doc.id],
-                    title=[doc.title],
-                    body=[doc.body],
-                    title_vector=[vec_bytes],
-                ))
-                indexed += 1
-
-                if indexed % batch_size == 0:
-                    writer.commit()
-                    if time.time() - last_log > 2.0:
-                        elapsed = time.time() - start
-                        rate = indexed / elapsed if elapsed > 0 else 0
-                        log.info("Progress: %d docs indexed (%.0f/sec)", indexed, rate)
-                        last_log = time.time()
-
-                if max_docs > 0 and indexed >= max_docs:
-                    log.info("Reached max-docs limit (%d)", max_docs)
-                    break
+            if batch and (max_docs == 0 or indexed < max_docs):
+                _process_batch(batch)
 
         writer.commit()
         self.index.reload()

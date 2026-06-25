@@ -22,6 +22,7 @@ log = logging.getLogger(__name__)
 class EmbedClient(Protocol):
     """Interface for embedding clients."""
     async def get_embedding(self, text: str) -> List[float]: ...
+    async def get_embeddings(self, texts: List[str]) -> List[List[float]]: ...
     async def close(self): ...
 
 
@@ -139,6 +140,15 @@ class LocalEmbedder:
         embeddings = list(self._model.embed([text]))
         return embeddings[0].tolist()
     
+    async def get_embeddings(self, texts: List[str]) -> List[List[float]]:
+        """Batch embedding. Bypasses deduplication/cache for maximum bulk throughput."""
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(self._onnx_pool, self._embed_batch_sync, texts)
+
+    def _embed_batch_sync(self, texts: List[str]) -> List[List[float]]:
+        embeddings = list(self._model.embed(texts))
+        return [e.tolist() for e in embeddings]
+    
     def _put_local(self, key: str, vector: List[float]):
         """Insert into LRU cache with eviction."""
         if key in self._cache:
@@ -222,6 +232,10 @@ class OllamaClient:
             raise
         finally:
             self._inflight.pop(cache_key, None)
+
+    async def get_embeddings(self, texts: List[str]) -> List[List[float]]:
+        """Fallback to concurrent single requests for Ollama API."""
+        return await asyncio.gather(*(self.get_embedding(t) for t in texts))
 
     async def _get_client(self) -> 'aiohttp.ClientSession':
         if self.client is None:

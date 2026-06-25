@@ -13,7 +13,6 @@ from typing import List, Dict, Any
 
 def fuse_with_weights(
     hits: List[Dict[str, Any]],
-    query_vector: List[float],
     alpha: float,
     limit: int,
 ) -> List[Dict[str, Any]]:
@@ -44,7 +43,6 @@ def fuse_with_weights(
 
 def fuse_with_rrf(
     hits: List[Dict[str, Any]],
-    query_vector: List[float],
     limit: int,
     k: int = 60,
 ) -> List[Dict[str, Any]]:
