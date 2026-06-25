@@ -1,0 +1,30 @@
+# Core web framework
+fastapi==0.115.0
+uvicorn==0.30.0
+
+# HTTP client for shard fan-out (PERF-03: C-accelerated parser)
+aiohttp>=3.9.0
+
+# Fast JSON
+orjson==3.10.0
+
+# Tantivy search engine bindings
+tantivy==0.22.0
+
+# Numpy for vector operations
+numpy==2.0.0
+
+# Local ONNX embeddings (~150MB, replaces Ollama HTTP call)
+fastembed==0.4.1
+
+# etcd client for shard discovery
+etcd3==0.12.0
+
+# Redis async client for caching
+redis==5.0.0
+
+# YAML config parsing
+pyyaml==6.0.2
+
+# XML parsing for ingester
+lxml==5.2.0
