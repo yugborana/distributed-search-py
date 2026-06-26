@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: search-config
+  namespace: search
+  labels:
+    app.kubernetes.io/part-of: distributed-search
+data:
+  ETCD_HOSTS: "etcd-0.etcd-headless.search.svc.cluster.local"
+  REDIS_URL: "redis://:$(REDIS_PASSWORD)@redis.search.svc.cluster.local:6379"
+  EMBED_PROVIDER: "local"
+  FUSION_ALPHA: "0.5"
+  SHARD_MODE: "inprocess"
+  INDEX_BASE: "/app/indices/search.idx"
+  NUM_PARTITIONS: "8"
+  PYTHONPATH: "/app"

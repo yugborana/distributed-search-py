@@ -1,0 +1,39 @@
+# Shared index storage — ReadWriteMany so coordinator replicas + indexer jobs
+# can all mount the same volume simultaneously.
+#
+# IMPORTANT: Update storageClassName for your cloud:
+#   AWS  → efs-sc       (requires EFS CSI driver)
+#   GCP  → filestore-rwx (requires Filestore CSI driver)
+#   Azure→ azurefile
+#   Bare → nfs
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: search-index-pvc
+  namespace: search
+  labels:
+    app.kubernetes.io/part-of: distributed-search
+spec:
+  accessModes:
+    - ReadWriteMany
+  storageClassName: YOUR_RWX_STORAGECLASS   # efs-sc on AWS, filestore-rwx on GCP, azurefile on Azure, nfs on bare metal
+  resources:
+    requests:
+      storage: 50Gi
+---
+# Raw data PVC — where JSONL source files live for the indexer CronJob.
+# Can be a separate volume or an S3-fuse mount.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: raw-data-pvc
+  namespace: search
+  labels:
+    app.kubernetes.io/part-of: distributed-search
+spec:
+  accessModes:
+    - ReadOnlyMany
+  storageClassName: YOUR_RWX_STORAGECLASS   # efs-sc on AWS, filestore-rwx on GCP, azurefile on Azure, nfs on bare metal
+  resources:
+    requests:
+      storage: 20Gi

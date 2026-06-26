@@ -45,9 +45,54 @@ def main():
                         help="Embedding provider: 'local' (ONNX) or 'ollama' (empty = no embeddings)")
     parser.add_argument("--ollama-host", default="localhost",
                         help="Ollama server host (only used if --embed-provider=ollama)")
+    parser.add_argument("--num-shards", type=int, default=1,
+                        help="Number of shards to process concurrently (loads model once)")
+    parser.add_argument("--input-pattern", default="",
+                        help="Input file pattern with {} for shard ID (e.g. shard-{}.jsonl)")
     args = parser.parse_args()
 
-    # Determine final index path
+    start = time.time()
+
+    # Create embedding client once
+    embed_client = None
+    if args.embed_provider:
+        log.info("Embedding mode: %s", args.embed_provider)
+        embed_client = create_embed_client(
+            provider=args.embed_provider,
+            ollama_url=f"http://{args.ollama_host}:11434",
+        )
+
+    if args.num_shards > 1 and args.input_pattern:
+        import concurrent.futures
+        
+        def process_shard(shard_id):
+            shard_input = args.input_pattern.format(shard_id) if "{}" in args.input_pattern else args.input_pattern
+            if not Path(shard_input).is_file():
+                log.warning("Shard file %s not found, skipping.", shard_input)
+                return 0
+            
+            index_path = f"{args.index}-{shard_id}"
+            log.info("Indexing shard-%d → %s", shard_id, index_path)
+            
+            idx = SearchIndex(index_path, embed_client=embed_client)
+            count = idx.index_jsonl(shard_input, batch_size=args.batch_size, max_docs=args.max_docs)
+            idx.close()
+            return count
+
+        total_docs = 0
+        with concurrent.futures.ThreadPoolExecutor(max_workers=args.num_shards) as executor:
+            futures = {executor.submit(process_shard, i): i for i in range(args.num_shards)}
+            for future in concurrent.futures.as_completed(futures):
+                try:
+                    total_docs += future.result()
+                except Exception as e:
+                    log.error("Shard indexing failed: %s", e)
+                
+        elapsed = time.time() - start
+        log.info("Indexer complete in %.1fs! (%d docs total across %d shards)", elapsed, total_docs, args.num_shards)
+        return
+
+    # Fallback to single shard logic
     index_path = args.index
     if args.shard_id >= 0:
         index_path = f"{args.index}-{args.shard_id}"
@@ -60,23 +105,8 @@ def main():
         args.input, index_path, args.batch_size, args.max_docs,
     )
 
-    start = time.time()
-
-    # Create embedding client if provider is specified
-    embed_client = None
-    if args.embed_provider:
-        log.info("Embedding mode: %s", args.embed_provider)
-        embed_client = create_embed_client(
-            provider=args.embed_provider,
-            ollama_url=f"http://{args.ollama_host}:11434",
-        )
-
-    # Create or open the Tantivy index
     idx = SearchIndex(index_path, embed_client=embed_client)
-
-    # Index documents from JSONL
     count = idx.index_jsonl(args.input, batch_size=args.batch_size, max_docs=args.max_docs)
-
     idx.close()
 
     elapsed = time.time() - start

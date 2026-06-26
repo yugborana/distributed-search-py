@@ -55,7 +55,7 @@ def clean_wiki_text(raw: str) -> str:
 
 def shard_for_doc(doc_id: str, num_shards: int) -> int:
     h = hashlib.md5(doc_id.encode()).digest()
-    return h[0] % num_shards
+    return int.from_bytes(h[:8], byteorder="big") % num_shards
 
 
 def process_page(args: tuple) -> Doc | None:

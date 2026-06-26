@@ -1,0 +1,10 @@
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: coordinator-pdb
+  namespace: search
+spec:
+  minAvailable: 1    # always keep at least 1 coordinator running
+  selector:
+    matchLabels:
+      app: coordinator

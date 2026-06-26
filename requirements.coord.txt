@@ -13,3 +13,4 @@ pyyaml==6.0.2
 fastembed==0.4.1
 uvloop>=0.19.0    # PERF-02: 2-4x faster event loop (Linux only, used in Docker)
 httptools>=0.6.0  # PERF-11: C-accelerated HTTP parser for uvicorn
+prometheus-client>=0.20.0  # Prometheus metrics for K8s monitoring
