@@ -15,8 +15,6 @@ RUN python -c "from fastembed import TextEmbedding; TextEmbedding('sentence-tran
 
 COPY cmd/ cmd/
 COPY internal/ internal/
-COPY scripts/rebuild-index.sh /app/scripts/rebuild-index.sh
-RUN chmod +x /app/scripts/rebuild-index.sh
 COPY system_config.yaml .
 
 EXPOSE 8090

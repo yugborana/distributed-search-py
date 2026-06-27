@@ -15,7 +15,7 @@ import gzip
 import os
 import sys
 from collections import OrderedDict
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from typing import List, Dict, Any
 
@@ -57,69 +57,6 @@ log.addHandler(handler)
 # on every response. ORJSONResponse uses orjson.dumps() directly — 3-10x faster
 # for numeric-heavy payloads (hit scores, vectors).
 app = FastAPI(title="Distributed Search — Coordinator", default_response_class=ORJSONResponse)
-
-# ── Prometheus Metrics ──────────────────────────────────────────────────────
-try:
-    from prometheus_client import Counter, Histogram, Gauge, make_asgi_app, CollectorRegistry
-
-    search_registry = CollectorRegistry()
-
-    REQUEST_COUNT = Counter(
-        "search_requests_total", "Total search requests", ["endpoint", "status"],
-        registry=search_registry
-    )
-    REQUEST_LATENCY = Histogram(
-        "search_latency_seconds", "Search request latency", ["endpoint"],
-        buckets=[0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5],
-        registry=search_registry
-    )
-    CACHE_HITS = Counter(
-        "search_cache_hits_total", "Cache hits", ["tier"],
-        registry=search_registry
-    )
-    CACHE_MISSES = Counter(
-        "search_cache_misses_total", "Cache misses", ["tier"],
-        registry=search_registry
-    )
-    INDEX_DOC_COUNT = Gauge(
-        "search_index_doc_count", "Total indexed documents",
-        registry=search_registry
-    )
-    EMBED_LATENCY = Histogram(
-        "search_embed_latency_seconds", "Embedding generation latency",
-        buckets=[0.001, 0.005, 0.01, 0.025, 0.05, 0.1],
-        registry=search_registry
-    )
-
-    # Mount the /metrics endpoint for Prometheus scraping
-    metrics_app = make_asgi_app(registry=search_registry)
-    app.mount("/metrics", metrics_app)
-    _METRICS_ENABLED = True
-except ImportError:
-    _METRICS_ENABLED = False
-
-from fastapi import Request
-
-@app.middleware("http")
-async def metrics_middleware(request: Request, call_next):
-    if not _METRICS_ENABLED or request.url.path not in ["/search", "/hybrid"]:
-        return await call_next(request)
-        
-    t_start = time.perf_counter()
-    endpoint = request.url.path.strip("/")
-    
-    try:
-        response = await call_next(request)
-        status_code = str(response.status_code)
-    except Exception as e:
-        status_code = "500"
-        REQUEST_COUNT.labels(endpoint=endpoint, status=status_code).inc()
-        REQUEST_LATENCY.labels(endpoint=endpoint).observe(time.perf_counter() - t_start)
-        raise e
-        
-    REQUEST_COUNT.labels(endpoint=endpoint, status=status_code).inc()
-    REQUEST_LATENCY.labels(endpoint=endpoint).observe(time.perf_counter() - t_start)
-    return response
 
 etcd_host_global = os.environ.get("ETCD_HOSTS", "localhost")
 redis_host_global = os.environ.get("REDIS_HOST", "localhost")
@@ -292,11 +229,7 @@ async def startup_event():
     global rdb, embed_client, http_pool, partition_manager
 
     if aioredis is not None:
-        redis_url = os.environ.get("REDIS_URL", f"redis://{redis_host_global}:6379")
-        # In Kubernetes envFrom, $(VAR) is not evaluated. We interpolate manually.
-        if "$(REDIS_PASSWORD)" in redis_url:
-            redis_url = redis_url.replace("$(REDIS_PASSWORD)", os.environ.get("REDIS_PASSWORD", ""))
-        rdb = aioredis.from_url(redis_url, decode_responses=False)
+        rdb = aioredis.from_url(f"redis://{redis_host_global}:6379", decode_responses=False)
 
     embed_client = create_embed_client(
         provider=embed_provider,
@@ -316,8 +249,6 @@ async def startup_event():
         )
         log.info("SHARD_MODE=inprocess: %d partitions loaded, %d total docs",
                  len(partition_manager.partitions), partition_manager.total_docs())
-        if _METRICS_ENABLED:
-            INDEX_DOC_COUNT.set(partition_manager.total_docs())
 
         # Automatically refresh the in-process searchers to pick up newly indexed docs
         async def refresh_partitions_task():
@@ -326,21 +257,8 @@ async def startup_event():
                 await asyncio.sleep(30)
                 if partition_manager:
                     await loop.run_in_executor(None, partition_manager.reload_all)
-                    if _METRICS_ENABLED:
-                        INDEX_DOC_COUNT.set(partition_manager.total_docs())
 
         asyncio.create_task(refresh_partitions_task())
-
-        if partition_manager is not None and len(partition_manager.partitions) > 0:
-            async def _warmup():
-                await asyncio.sleep(2)   # tiny delay for event loop to settle
-                try:
-                    # Prime OS page cache and ONNX session
-                    await partition_manager.scored_search_all("warmup", [], limit=1)
-                    log.info("Warmup complete - index pages cached, ONNX session warm")
-                except Exception as e:
-                    log.warning("Warmup failed (non-fatal): %s", e)
-            asyncio.create_task(_warmup())
     else:
         # Distributed mode: fan-out via gRPC/HTTP to separate shard containers
         http_pool = aiohttp.ClientSession(
@@ -540,8 +458,6 @@ async def do_hybrid_search(q: str, limit: int, alpha: float, fusion: str) -> Dic
         except Exception as e:
             log.warning(f"Embedding failed for '{q}': {e} (falling back to keyword-only)")
     t1 = time.perf_counter()
-    if _METRICS_ENABLED:
-        EMBED_LATENCY.observe(t1 - t0)
 
     # PERF-13: In-process partition scored search — zero network overhead
     if partition_manager is not None:
@@ -717,19 +633,10 @@ async def search_handler(
     # If L0 hit, we get a pre-serialized raw Response object
     from fastapi.responses import Response
     if isinstance(result_or_response, Response):
-        if _METRICS_ENABLED:
-            CACHE_HITS.labels(tier="L0").inc()
         return result_or_response
 
     # Otherwise, it's a dict that needs serialization
     result_or_response["cache"] = cache_state
-    if _METRICS_ENABLED:
-        if cache_state == "HIT":
-            CACHE_HITS.labels(tier="redis").inc()
-        elif cache_state == "MISS":
-            CACHE_MISSES.labels(tier="all").inc()
-        elif cache_state == "COALESCED":
-            CACHE_HITS.labels(tier="coalesced").inc()
     return result_or_response
 
 
@@ -738,7 +645,7 @@ async def hybrid_handler(
     q: str = Query(None, description="Search query"),
     limit: int = Query(20, ge=1, le=1000, description="Number of results"),
     alpha: float = Query(fusion_alpha_default, ge=0.0, le=1.0),
-    fusion: str = Query("rrf", pattern="^(rrf|weighted)$"),
+    fusion: str = Query("rrf", regex="^(rrf|weighted)$"),
 ):
     if not q:
         return JSONResponse(status_code=400, content={"error": "missing 'q' parameter"})
@@ -748,8 +655,6 @@ async def hybrid_handler(
     # PERF-14: L0 in-memory cache — bypasses ORJSONResponse serialization entirely
     l0_bytes = _l0_get(cache_key)
     if l0_bytes is not None:
-        if _METRICS_ENABLED:
-            CACHE_HITS.labels(tier="L0").inc()
         from fastapi.responses import Response
         return Response(content=l0_bytes, media_type="application/json")
 
@@ -758,8 +663,6 @@ async def hybrid_handler(
         result = await _inflight_hybrid[cache_key]
         result = dict(result)  # shallow copy so we can mutate cache field
         result["cache"] = "COALESCED"
-        if _METRICS_ENABLED:
-            CACHE_HITS.labels(tier="coalesced").inc()
         return result
 
     if rdb is not None:
@@ -769,8 +672,6 @@ async def hybrid_handler(
                 result = _cache_decompress(cached)
                 _l0_put(cache_key, result)
                 result["cache"] = "HIT"
-                if _METRICS_ENABLED:
-                    CACHE_HITS.labels(tier="redis").inc()
                 return result
         except Exception:
             pass
@@ -790,8 +691,6 @@ async def hybrid_handler(
             asyncio.create_task(_redis_set_bg(cache_key, HYBRID_CACHE_TTL, result))
 
         result["cache"] = "MISS"
-        if _METRICS_ENABLED:
-            CACHE_MISSES.labels(tier="all").inc()
         return result
     except Exception as e:
         future.set_exception(e)
@@ -892,7 +791,7 @@ def main():
         "cmd.coordinator:app",
         host="0.0.0.0",
         port=args.port,
-        log_level="info",
+        log_level="warning",
         access_log=False,
         # PERF-02: Reduced from 8 to 2 workers.
         # The coordinator is I/O-bound (fan-out to shards + Redis), not CPU-bound.
